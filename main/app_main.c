@@ -38,12 +38,12 @@ static const char *TAG = "example_foc";
 // 电机参数
 #define EXAMPLE_MOTOR_POLE_PAIRS          7   // 电机极对数
 #define EXAMPLE_MOTOR_MAX_VOLTAGE         0.8 // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
-#define EXAMPLE_MOTOR_OPENLOOP_RPM        2000 // 开环控制转速 (RPM)
+#define EXAMPLE_MOTOR_OPENLOOP_RPM        8000 // 开环控制转速 (RPM)
 
 // AS5600编码器配置
 #define AS5600_SDA_PIN      19      // SDA引脚
 #define AS5600_SCL_PIN      18      // SCL引脚
-#define AS5600_I2C_FREQ     400000  // 400kHz - 降低频率以提高稳定性
+#define AS5600_I2C_FREQ     1000000  // 1MHz
 #define AS5600_I2C_PORT     I2C_NUM_0  // 使用I2C_0端口
 
 void bsp_bridge_driver_init(void)
@@ -74,7 +74,7 @@ uint32_t dt = 0;
 // 定义FOC任务常量
 #define FOC_TASK_STACK_SIZE     8192
 #define FOC_TASK_PRIORITY       5
-#define FOC_CONTROL_FREQ_HZ     4000  // 4kHz控制频率
+#define FOC_CONTROL_FREQ_HZ     2000  // 4kHz控制频率
 #define FOC_TASK_CORE_ID        1     // 在核心1上运行
 
 // FOC控制任务全局变量
@@ -173,14 +173,15 @@ static void foc_control_task(void* arg)
             dt = esp_timer_get_time() - last_update_time;
             last_update_time = esp_timer_get_time();
             as5600_set_dt(dt / 1000000.0f);
-            // 更新编码器数据
-            as5600_update(); 
             
-            // 读取当前电角度 (可用于闭环控制)
-            // _iq electrical_angle = as5600_get_electrical_angle_iq(params->pole_pairs);
+            // 更新编码器数据
+            as5600_update();  
+            //int16_t raw_angle = as5600_get_raw_angle();
+            // 读取当前电角度 (可用于闭环控制) - 使用IQMath优化版本
+            //_iq electrical_angle_iq = as5600_get_electrical_angle_iq(params->pole_pairs);
             
             // 执行FOC控制 (当前仍为开环)
-            //foc_openloop_output(inverter, params);
+            foc_openloop_output(inverter, params);
             
             // 每100次循环(约40ms)向串口任务发送一次数据
             if (count >= 100) {
@@ -189,7 +190,7 @@ static void foc_control_task(void* arg)
                 // 获取当前状态
                 foc_openloop_state_t *state = foc_openloop_get_state();
                 
-                // 准备数据包
+                // 准备数据包 - 使用优化后的IQ版本，但保持接口兼容性
                 uart_data_packet_t data = {
                     .timestamp = dt,
                     .duty_u = state->duty_u,
@@ -335,7 +336,7 @@ void app_main(void)
         UART_TASK_CORE_ID       // 运行的核心
     );
     
-    // 启动定时器，周期为1/4000秒 (250微秒)
+    // 启动定时器，周期为1/2000秒 (500微秒)
     ESP_ERROR_CHECK(esp_timer_start_periodic(foc_timer_handle, 1000000 / FOC_CONTROL_FREQ_HZ));
     
     ESP_LOGI(TAG, "系统初始化完成，带编码器反馈的FOC控制");

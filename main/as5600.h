@@ -1,12 +1,16 @@
 /*
  * AS5600 磁编码器驱动
- * 使用标准浮点数计算
+ * 使用IQMath定点运算优化
  */
 #pragma once
 
 #include <stdint.h>
 #include "esp_err.h"
 #include "driver/i2c.h"
+// Use IQ18 type, range [-8,192 8,191.999 996 185]
+// This definition should be added before including "IQmathLib.h"
+#define GLOBAL_IQ               18
+#include "IQmathLib.h" // 添加IQMath库
 
 // AS5600常量定义
 #define AS5600_ADDR         0x36    // AS5600 I2C地址
@@ -17,20 +21,25 @@
 
 #define AS5600_MAX_RAW_ANGLE 4095   // 12位编码器的最大原始值
 
+// IQMath常量定义
+#define _2PI_IQ        _IQ(6.28318530718)
+#define _60_IQ         _IQ(60.0)
+#define _RPM_SCALE_IQ  _IQ(60.0 / (2.0 * M_PI))  // RPM = rad/s * 60 / (2π)
+#define _SCALE_IQ      _IQ(0.0015339808)         // 2π/4096
+
 // AS5600数据结构
 typedef struct {
     uint16_t raw_angle;             // 原始角度值 (0-4095)
     uint16_t angle_prev;            // 上一次的角度值
     int32_t full_rotations;         // 完整旋转圈数
     int32_t total_angle_raw;        // 总角度原始值
-    float rotor_phy_angle;          // 物理角度(弧度) - 范围0-2π
-    float position_rad;             // 位置(弧度) - 多圈可能很大
-    float rotor_zero_angle_rad;     // 零点角度(弧度) - 范围0-2π
-    float rotor_phy_angle_rad;      // 物理角度(弧度) - 范围0-2π
-    float velocity_rad_per_sec;     // 速度(弧度/秒)
-    float velocity_rpm;             // 速度(RPM) - 可能达到数千
-    float velocity_filtered;        // 滤波后的速度
-    float dt;                       // 采样周期
+    float rotor_phy_angle;          // 物理角度(弧度) - 范围0-2π (保留浮点供外部接口使用)
+    float position_rad;             // 位置(弧度) - 多圈可能很大 (保留浮点供外部接口使用)
+    _iq rotor_phy_angle_iq;        // 物理角度(弧度) - IQ格式
+    _iq velocity_rad_per_sec_iq;   // 速度(弧度/秒) - IQ格式
+    _iq velocity_rpm_iq;           // 速度(RPM) - IQ格式
+    _iq velocity_filtered_iq;      // 滤波后的速度 - IQ格式
+    _iq dt_iq;                     // 采样周期 - IQ格式
     uint8_t initialized;            // 初始化标志
 } as5600_t;
 
@@ -87,6 +96,14 @@ float as5600_get_angle(void);
  * @return float 电角度(弧度)
  */
 float as5600_get_electrical_angle(int pole_pairs);
+
+/**
+ * @brief 获取电角度(IQ格式)
+ * 
+ * @param pole_pairs 电机极对数
+ * @return _iq 电角度(弧度，IQ格式)
+ */
+_iq as5600_get_electrical_angle_iq(int pole_pairs);
 
 /**
  * @brief 获取转速

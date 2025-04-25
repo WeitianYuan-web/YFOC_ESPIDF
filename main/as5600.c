@@ -1,6 +1,6 @@
 /*
  * AS5600 磁编码器驱动
- * 使用标准浮点数计算
+ * 使用IQMath定点运算优化
  */
 #include <string.h>
 #include <math.h>
@@ -16,9 +16,9 @@ static const char *TAG = "as5600";
 #define _scale      0.0015339808f    
 #define _rpm_scale  (60.0f / (2.0f * M_PI))
 // I2C通信参数
-#define I2C_RETRY_COUNT     5        // 读取失败时重试次数(增加)
-#define I2C_TIMEOUT_MS      100      // I2C超时时间(毫秒)(增加)
-#define I2C_RETRY_DELAY_MS  10       // 重试前等待时间(毫秒)(新增)
+#define I2C_RETRY_COUNT     3        // 减少重试次数
+#define I2C_TIMEOUT_MS      20       // 减少超时时间
+#define I2C_RETRY_DELAY_MS  2        // 减少重试延迟
 
 // 全局变量
 static as5600_t g_as5600;           // AS5600状态
@@ -31,11 +31,11 @@ static struct {
     uint32_t retry_success;         // 重试成功次数
 } read_stats = {0};
 
-// 低通滤波器
-static float low_pass_filter(float input, float prev_output, float alpha) {
+// 低通滤波器 (IQ版本)
+static _iq low_pass_filter_iq(_iq input, _iq prev_output, _iq alpha) {
     // output = alpha * input + (1 - alpha) * prev_output
-    float one_minus_alpha = 1.0f - alpha;
-    return alpha * input + one_minus_alpha * prev_output;
+    _iq one_minus_alpha = _IQ(1.0) - alpha;
+    return _IQmpy(alpha, input) + _IQmpy(one_minus_alpha, prev_output);
 }
 
 // 读取AS5600寄存器
@@ -121,7 +121,9 @@ esp_err_t as5600_init(int sda_pin, int scl_pin, uint32_t i2c_freq, i2c_port_t i2
         return ret;
     }
     
-    ret = i2c_driver_install(i2c_port, conf.mode, 0, 0, 0);
+    // 使用DMA模式安装I2C驱动
+    // 参数: 端口, 模式, RX缓冲区大小, TX缓冲区大小, 中断标志
+    ret = i2c_driver_install(i2c_port, conf.mode, 128, 128, ESP_INTR_FLAG_IRAM);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C驱动安装失败: %s", esp_err_to_name(ret));
         return ret;
@@ -129,7 +131,7 @@ esp_err_t as5600_init(int sda_pin, int scl_pin, uint32_t i2c_freq, i2c_port_t i2
     
     // 初始化AS5600结构体
     memset(&g_as5600, 0, sizeof(as5600_t));
-    g_as5600.dt = 0.001f;  // 默认采样周期1ms
+    g_as5600.dt_iq = _IQ(0.001);  // 默认采样周期1ms (IQ格式)
     
     // 等待设备上电稳定
     vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -181,12 +183,12 @@ esp_err_t as5600_init(int sda_pin, int scl_pin, uint32_t i2c_freq, i2c_port_t i2
 
 // 设置AS5600采样周期
 void as5600_set_dt(float dt_sec) {
-    g_as5600.dt = dt_sec;
+    g_as5600.dt_iq = _IQ(dt_sec);
 }
 
 // 设置零点角度
 void as5600_set_zero_angle(float zero_angle_rad) {
-    g_as5600.rotor_zero_angle_rad = zero_angle_rad;
+    // 未使用零点角度，保留此接口以兼容旧代码
 }
 
 // 获取原始角度值
@@ -248,58 +250,55 @@ esp_err_t as5600_update(void) {
     // 计算总角度（原始值）
     g_as5600.total_angle_raw = g_as5600.full_rotations * 4096 + raw_angle;
     
-    // 计算物理角度（弧度）
-    g_as5600.rotor_phy_angle = raw_angle * _scale;
+    // 使用IQMath计算物理角度 (弧度) - 优化计算
+    _iq raw_angle_iq = _IQ(raw_angle);
+    g_as5600.rotor_phy_angle_iq = _IQmpy(raw_angle_iq, _SCALE_IQ);
 
-    // 将物理角度标准化到 [0, 2π) 范围内，保持总圈数信息在position_rad中
-    while (g_as5600.rotor_phy_angle >= _2PI) {
-        g_as5600.rotor_phy_angle -= _2PI;
+    // 将IQ物理角度标准化到 [0, 2π) 范围内
+    while (_IQtoF(g_as5600.rotor_phy_angle_iq) >= _IQtoF(_2PI_IQ)) {
+        g_as5600.rotor_phy_angle_iq = g_as5600.rotor_phy_angle_iq - _2PI_IQ;
     }
-    while (g_as5600.rotor_phy_angle < 0) {
-        g_as5600.rotor_phy_angle += _2PI;
+    while (_IQtoF(g_as5600.rotor_phy_angle_iq) < 0) {
+        g_as5600.rotor_phy_angle_iq = g_as5600.rotor_phy_angle_iq + _2PI_IQ;
     }
     
-    // 计算角速度
-    float angle_diff_rad;
+    // 同时更新浮点物理角度以供外部接口使用
+    g_as5600.rotor_phy_angle = _IQtoF(g_as5600.rotor_phy_angle_iq);
+    
+    // 计算角速度 (使用IQMath)
+    _iq angle_diff_iq;
     
     if (angle_diff < -2048) {
         // 过零点，顺时针旋转
-        angle_diff_rad = (angle_diff + 4096) * _scale;
+        angle_diff_iq = _IQmpy(_IQ(angle_diff + 4096), _SCALE_IQ);
     } else if (angle_diff > 2048) {
         // 过零点，逆时针旋转
-        angle_diff_rad = (angle_diff - 4096) * _scale;
+        angle_diff_iq = _IQmpy(_IQ(angle_diff - 4096), _SCALE_IQ);
     } else {
         // 正常情况
-        angle_diff_rad = angle_diff * _scale;
+        angle_diff_iq = _IQmpy(_IQ(angle_diff), _SCALE_IQ);
     }
     
-    // 计算角速度 (弧度/秒)
-    g_as5600.velocity_rad_per_sec = angle_diff_rad / g_as5600.dt;
+    // 计算角速度 (弧度/秒) (IQ格式)
+    g_as5600.velocity_rad_per_sec_iq = _IQdiv(angle_diff_iq, g_as5600.dt_iq);
     
-    // 计算RPM (RPM = rad/s * 60 / 2π)
-    g_as5600.velocity_rpm = g_as5600.velocity_rad_per_sec * _rpm_scale;
+    // 计算RPM (RPM = rad/s * 60 / 2π) (IQ格式)
+    g_as5600.velocity_rpm_iq = _IQmpy(g_as5600.velocity_rad_per_sec_iq, _RPM_SCALE_IQ);
     
-    // 应用低通滤波 - 增加滤波系数，使响应更快
-    float alpha = 0.1f; // 滤波系数
+    // 应用低通滤波 - 优化IQ计算
+    _iq alpha = _IQ(0.02); // 滤波系数
     
     if (g_as5600.initialized == 1) {
         // 第一次运行，初始化滤波值
-        g_as5600.velocity_filtered = g_as5600.velocity_rpm;
+        g_as5600.velocity_filtered_iq = g_as5600.velocity_rpm_iq;
         g_as5600.initialized = 2;
     } else {
-        // 应用滤波
-        g_as5600.velocity_filtered = low_pass_filter(
-            g_as5600.velocity_rpm,
-            g_as5600.velocity_filtered,
+        // 应用滤波 (IQ格式)
+        g_as5600.velocity_filtered_iq = low_pass_filter_iq(
+            g_as5600.velocity_rpm_iq,
+            g_as5600.velocity_filtered_iq,
             alpha
         );
-    }
-    
-    // 调试输出 - 每50次更新输出一次信息
-    static uint32_t debug_counter = 0;
-    if (++debug_counter % 50 == 0) {
-        ESP_LOGD(TAG, "角度=%d, 速度=%f RPM, 滤波后速度=%f RPM", 
-                 raw_angle, g_as5600.velocity_rpm, g_as5600.velocity_filtered);
     }
     
     return ret; // 返回读取结果，即使出错也完成了计算
@@ -310,24 +309,40 @@ float as5600_get_angle(void) {
     return g_as5600.rotor_phy_angle;
 }
 
-// 获取电角度
+// 获取电角度 (浮点格式，兼容原接口)
 float as5600_get_electrical_angle(int pole_pairs) {
     float elec_angle = g_as5600.rotor_phy_angle * pole_pairs;
     
     // 确保角度在[0, 2π)范围内
-    while (elec_angle >= _2PI) {
-        elec_angle -= _2PI;
+    while (elec_angle >= 6.28318530718f) {
+        elec_angle -= 6.28318530718f;
     }
     while (elec_angle < 0) {
-        elec_angle += _2PI;
+        elec_angle += 6.28318530718f;
     }
     
     return elec_angle;
 }
 
-// 获取转速
+// 获取电角度 (IQ格式) - 新接口
+_iq as5600_get_electrical_angle_iq(int pole_pairs) {
+    _iq pole_pairs_iq = _IQ(pole_pairs);
+    _iq elec_angle_iq = _IQmpy(g_as5600.rotor_phy_angle_iq, pole_pairs_iq);
+    
+    // 确保角度在[0, 2π)范围内
+    while (_IQtoF(elec_angle_iq) >= _IQtoF(_2PI_IQ)) {
+        elec_angle_iq = elec_angle_iq - _2PI_IQ;
+    }
+    while (_IQtoF(elec_angle_iq) < 0) {
+        elec_angle_iq = elec_angle_iq + _2PI_IQ;
+    }
+    
+    return elec_angle_iq;
+}
+
+// 获取转速 (浮点格式，兼容原接口)
 float as5600_get_speed(void) {
-    return g_as5600.velocity_filtered;
+    return _IQtoF(g_as5600.velocity_filtered_iq);
 } 
 
 // 获取总角度原始值
