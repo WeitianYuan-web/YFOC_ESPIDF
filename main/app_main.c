@@ -14,6 +14,7 @@
 #include "foc_control.h"
 #include "driver/uart.h"
 #include "as5600.h"
+#include "motor_current_sense.h"   // 添加电流采样库头文件
 
 static const char *TAG = "example_foc";
 
@@ -21,8 +22,8 @@ static const char *TAG = "example_foc";
 ////////////// Please update the following configuration according to your HardWare spec /////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 #define EXAMPLE_FOC_DRV_EN_GPIO          12
-#define EXAMPLE_FOC_PWM_U_GPIO           32
-#define EXAMPLE_FOC_PWM_V_GPIO           33
+#define EXAMPLE_FOC_PWM_U_GPIO           33
+#define EXAMPLE_FOC_PWM_V_GPIO           32
 #define EXAMPLE_FOC_PWM_W_GPIO           25
 
 // UART配置
@@ -34,6 +35,9 @@ static const char *TAG = "example_foc";
 #define EXAMPLE_FOC_MCPWM_TIMER_RESOLUTION_HZ 20000000 // 20MHz, 1 tick = 0.05us
 #define EXAMPLE_FOC_MCPWM_PERIOD              2000     // 2000 * 0.05us = 100us, 10KHz
 
+// 电流采样引脚配置
+#define CURRENT_SENSE_U_PIN 39  // U相电流采样GPIO39
+#define CURRENT_SENSE_V_PIN 36  // V相电流采样GPIO36
 
 // 电机参数
 #define EXAMPLE_MOTOR_POLE_PAIRS          7   // 电机极对数
@@ -82,6 +86,10 @@ static TaskHandle_t foc_task_handle = NULL;
 static SemaphoreHandle_t foc_timer_semaphore = NULL;
 static esp_timer_handle_t foc_timer_handle = NULL;
 
+// 定义电流采样变量
+static current_sense_reading_t g_current_reading;
+static bool g_current_sense_initialized = false;
+
 // FOC控制定时器回调函数
 static void foc_timer_callback(void* arg)
 {
@@ -107,6 +115,11 @@ typedef struct {
     float encoder_speed;     // 编码器速度(RPM)
     int32_t total_angle_raw; // 总角度原始值
     int32_t full_rotations;  // 完整旋转圈数
+    float current_u;         // U相电流(安培)
+    float current_v;         // V相电流(安培)
+    float current_w;         // W相电流(安培)
+    float d_current;         // d轴电流(安培)
+    float q_current;         // q轴电流(安培)
 } uart_data_packet_t;
 
 // 全局队列句柄
@@ -125,7 +138,7 @@ static void uart_communication_task(void* arg)
         // 从队列接收数据，等待最多100ms
         if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
             // 发送数据到串口
-            float uart_buffer[10]; // 增加两个元素存放编码器数据
+            float uart_buffer[15]; // 增加两个元素存放编码器数据
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
@@ -136,9 +149,14 @@ static void uart_communication_task(void* arg)
             uart_buffer[7] = data.encoder_speed;
             uart_buffer[8] = data.total_angle_raw;
             uart_buffer[9] = data.full_rotations;
-            
+            uart_buffer[10] = data.current_u;
+            uart_buffer[11] = data.current_v;
+            uart_buffer[12] = data.current_w;
+            uart_buffer[13] = data.d_current;
+            uart_buffer[14] = data.q_current;
+
             // 发送数据
-            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 10);
+            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 15);
             
             // 发送帧尾
             uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f};
@@ -167,6 +185,62 @@ static void foc_control_task(void* arg)
     foc_openloop_params_t* params = foc_openloop_get_params();
     uint8_t count = 0;
     
+    // 初始化电流采样模块（如果尚未初始化）
+    if (!g_current_sense_initialized) {
+        // 获取GPIO对应的ADC通道和单元
+        adc_unit_t u_unit;
+        adc_channel_t u_channel;
+        adc_unit_t v_unit;
+        adc_channel_t v_channel;
+        
+        esp_err_t ret;
+        ret = adc_continuous_io_to_channel(CURRENT_SENSE_U_PIN, &u_unit, &u_channel);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "GPIO %d不是有效的ADC引脚", CURRENT_SENSE_U_PIN);
+        } else {
+            ret = adc_continuous_io_to_channel(CURRENT_SENSE_V_PIN, &v_unit, &v_channel);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "GPIO %d不是有效的ADC引脚", CURRENT_SENSE_V_PIN);
+            } else {
+                // 配置电流采样模块
+                current_sense_config_t config = {
+                    .u_phase_gpio = CURRENT_SENSE_U_PIN,
+                    .v_phase_gpio = CURRENT_SENSE_V_PIN,
+                    .u_phase_unit = u_unit,
+                    .u_phase_channel = u_channel,
+                    .v_phase_unit = v_unit,
+                    .v_phase_channel = v_channel,
+                    .sample_freq_hz = 40000,          // 40kHz采样频率
+                    .zero_current_adc_u = 2048.0f,    // 默认零点值
+                    .zero_current_adc_v = 2048.0f,    // 默认零点值
+                    .use_w_calculation = true         // 通过计算得到W相电流
+                };
+                
+                // 初始化并校准电流采样模块
+                ret = current_sense_init(&config);
+                if (ret == ESP_OK) {
+                    // 电机未通电时校准零点
+                    ESP_LOGI(TAG, "开始电流传感器零点校准");
+                    ret = current_sense_calibrate(100);  // 采集100个样本进行校准
+                    if (ret == ESP_OK) {
+                        // 启动ADC连续转换
+                        ret = current_sense_start();
+                        if (ret == ESP_OK) {
+                            g_current_sense_initialized = true;
+                            ESP_LOGI(TAG, "电流采样模块已初始化并启动");
+                        } else {
+                            ESP_LOGE(TAG, "启动电流采样失败: %d", ret);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "校准电流传感器失败: %d", ret);
+                    }
+                } else {
+                    ESP_LOGE(TAG, "初始化电流采样模块失败: %d", ret);
+                }
+            }
+        }
+    }
+    
     while (true) {
         // 等待定时器触发
         if (xSemaphoreTake(foc_timer_semaphore, portMAX_DELAY) == pdTRUE) {
@@ -176,14 +250,33 @@ static void foc_control_task(void* arg)
             
             // 更新编码器数据
             as5600_update();  
-            //int16_t raw_angle = as5600_get_raw_angle();
-            // 读取当前电角度 (可用于闭环控制) - 使用IQMath优化版本
-            //_iq electrical_angle_iq = as5600_get_electrical_angle_iq(params->pole_pairs);
             
+            _iq electrical_angle_iq = as5600_get_electrical_angle_iq(params->pole_pairs);
+
+            // 读取电流数据（使用10ms超时）
+            if (g_current_sense_initialized) {
+                esp_err_t ret = current_sense_read(&g_current_reading, 10);
+                if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
+                    ESP_LOGW(TAG, "读取电流值失败: %d", ret);
+                }
+            }
+
+            foc_uvw_coord_t phase_currents = {
+                .u = _IQ(g_current_reading.current_u),
+                .v = _IQ(g_current_reading.current_v),
+                .w = _IQ(g_current_reading.current_w)
+            };
+            _iq electrical_angle = as5600_get_electrical_angle_iq(params->pole_pairs);
+
+            // 计算d-q轴电流
+            foc_dq_coord_t dq_currents;
+            foc_calculate_dq_current(&phase_currents, electrical_angle, &dq_currents);
+
             // 执行FOC控制 (当前仍为开环)
             foc_openloop_output(inverter, params);
             
-            // 每100次循环(约40ms)向串口任务发送一次数据
+
+            // 每100次循环(约50ms)向串口任务发送一次数据
             if (count >= 100) {
                 count = 0;
                 
@@ -201,8 +294,21 @@ static void foc_control_task(void* arg)
                     .encoder_angle = as5600_get_position(),
                     .encoder_speed = as5600_get_speed(),
                     .total_angle_raw = as5600_get_total_angle_raw(),
-                    .full_rotations = as5600_get_full_rotations()
+                    .full_rotations = as5600_get_full_rotations(),
+                    .current_u = g_current_reading.current_u,
+                    .current_v = g_current_reading.current_v,
+                    .current_w = g_current_reading.current_w,
+                    .d_current = _IQtoF(dq_currents.d),
+                    .q_current = _IQtoF(dq_currents.q)
                 };
+                
+/*                 // 如果电流采样已初始化，则打印电流信息
+                if (g_current_sense_initialized) {
+                    ESP_LOGI(TAG, "电流读数: U相=%.3fA, V相=%.3fA, W相=%.3fA",
+                            g_current_reading.current_u,
+                            g_current_reading.current_v,
+                            g_current_reading.current_w);
+                } */
                 
                 // 发送数据到队列，不等待(非阻塞)
                 xQueueSendToBack(uart_queue, &data, 0);
@@ -357,4 +463,10 @@ void app_main(void)
     ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_STOP_EMPTY));
     ESP_ERROR_CHECK(svpwm_del_inverter(inverter1));
     uart_driver_delete(UART_NUM);
+    
+    // 如果电流采样模块已初始化，则释放资源
+    if (g_current_sense_initialized) {
+        current_sense_stop();
+        current_sense_deinit();
+    }
 }

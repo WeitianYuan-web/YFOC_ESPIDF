@@ -72,4 +72,13 @@ void foc_inverse_park_transform(_iq theta_rad, const foc_dq_coord_t *v_dq, foc_a
  * @param out_uvw[out]  output modulated pwm duty in IQ type
  */
 void foc_svpwm_duty_calculate(const foc_ab_coord_t *v_ab, foc_uvw_coord_t *out_uvw);
+
+/**
+ * @brief 计算d轴和q轴电流
+ *
+ * @param[in] i_uvw         三相电流输入 (U,V,W)
+ * @param[in] theta_rad     电气角度(弧度)
+ * @param[out] i_dq         输出的d-q坐标系电流
+ */
+void foc_calculate_dq_current(const foc_uvw_coord_t *i_uvw, _iq theta_rad, foc_dq_coord_t *i_dq);
 #endif // ESP_FOC_H

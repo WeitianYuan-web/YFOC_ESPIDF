@@ -149,3 +149,24 @@ void foc_svpwm_duty_calculate(const foc_ab_coord_t *v_ab, foc_uvw_coord_t *out_u
     } break;
     }
 }
+
+/**
+ * @brief 计算d轴和q轴电流
+ * 
+ * 将三相电流通过Clarke变换和Park变换转换到d-q坐标系
+ *
+ * @param[in] i_uvw         三相电流输入 (U,V,W)
+ * @param[in] theta_rad     电气角度(弧度)
+ * @param[out] i_dq         输出的d-q坐标系电流
+ */
+void foc_calculate_dq_current(const foc_uvw_coord_t *i_uvw, _iq theta_rad, foc_dq_coord_t *i_dq)
+{
+    // 使用中间变量存储α-β坐标系的电流
+    foc_ab_coord_t i_ab;
+    
+    // 第一步：Clarke变换，将三相电流转换到α-β坐标系
+    foc_clarke_transform(i_uvw, &i_ab);
+    
+    // 第二步：Park变换，将α-β坐标系电流转换到d-q坐标系
+    foc_park_transform(theta_rad, &i_ab, i_dq);
+}
