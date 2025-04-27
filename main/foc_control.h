@@ -18,6 +18,9 @@ extern "C" {
  */
 typedef struct {
     float voltage_magnitude;     // 电压矢量幅值 (0.0-1.0)
+    float resistance;            // 电机相电阻(欧姆)
+    float supply_voltage;        // 电机供电电压(伏特)
+    float kv;                    // 电机KV值(RPM/V)
     float current_limit;         // 电流限制(安培)
     float speed_rpm;             // 设定转速 (RPM)
     int pole_pairs;              // 电机极对数

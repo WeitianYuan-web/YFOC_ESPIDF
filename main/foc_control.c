@@ -125,10 +125,56 @@ float foc_openloop_output(inverter_handle_t inverter)
         p_state->angle_elec = p_state->angle_elec + two_pi;
     }
     
-    // 设置dq输出(d轴施加电压，q轴设为0)
+    // 获取电机参数
+    float current_limit = s_openloop_params.current_limit;
+    float supply_voltage = s_openloop_params.supply_voltage;
+    float kv = s_openloop_params.kv;
+    float resistance = s_openloop_params.resistance;
+    float voltage_magnitude = s_openloop_params.voltage_magnitude;
+    
+    // 计算反电动势常数（Ke）
+    // Ke = 1/(kv * 2π/60) - 将kv(RPM/V)转换为电动势常数(V/(rad/s))
+    float ke = 1.0f / (kv * (2.0f * M_PI / 60.0f));
+    
+    // 计算反电动势大小
+    float bemf = ke * fabsf(p_state->target_speed_elec);
+    
+    // 计算电压输出
+    float vd = 0;
+    // q轴电压需要克服反电动势
+    float vq = bemf;
+    
+    // 考虑电阻损耗的额外电压
+    float v_ir = resistance * current_limit;
+    vq += v_ir;
+    
+    // 确保不超过电压限制
+    float v_magnitude = sqrtf(vd*vd + vq*vq);
+    float v_limit = supply_voltage * voltage_magnitude;
+    
+    if (v_magnitude > v_limit) {
+        // 按比例缩小电压
+        float scale = v_limit / v_magnitude;
+        vd *= scale;
+        vq *= scale;
+    }
+    
+    // 根据电压反推电流（I=V/R，简化模型）
+    float id = vd / resistance;
+    float iq = vq / resistance;
+    
+    // 确保电流不超过限制
+    float i_magnitude = sqrtf(id*id + iq*iq);
+    if (i_magnitude > current_limit) {
+        float i_scale = current_limit / i_magnitude;
+        id *= i_scale;
+        iq *= i_scale;
+    }
+
+    // 设置dq电流输出
     foc_dq_coord_t dq_out;
-    dq_out.d = _IQ(0);
-    dq_out.q = _IQ(s_openloop_params.current_limit);
+    dq_out.d = _IQ(id);
+    dq_out.q = _IQ(iq);
     
     // 执行Park逆变换
     foc_ab_coord_t ab_out;

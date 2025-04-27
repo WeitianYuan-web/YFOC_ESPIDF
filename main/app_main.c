@@ -48,8 +48,11 @@ static const char *TAG = "example_foc";
 
 // 电机参数
 #define EXAMPLE_MOTOR_POLE_PAIRS          7   // 电机极对数
+#define EXAMPLE_MOTOR_RESISTANCE          9.2f // 电机相电阻(欧姆)
+#define EXAMPLE_MOTOR_SUPPLY_VOLTAGE      12.0f // 电机供电电压(伏特)
+#define EXAMPLE_MOTOR_KV                  180.0f // 电机KV值(RPM/V)
 #define EXAMPLE_MOTOR_DIRECTION           -1  // 电机方向
-#define EXAMPLE_MOTOR_CURRENT_LIMIT      1.0f // 电流限制(安培)
+#define EXAMPLE_MOTOR_CURRENT_LIMIT      2.0f // 电流限制(安培)
 #define EXAMPLE_MOTOR_MAX_VOLTAGE         0.9 // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
 #define EXAMPLE_MOTOR_OPENLOOP_RPM        400 // 开环控制转速 (RPM)
 
@@ -87,7 +90,7 @@ uint32_t dt = 0;
 // 定义FOC任务常量
 #define FOC_TASK_STACK_SIZE     8192
 #define FOC_TASK_PRIORITY       5
-#define FOC_CONTROL_FREQ_HZ     2000  // 4kHz控制频率
+#define FOC_CONTROL_FREQ_HZ     4000  // 4kHz控制频率
 #define FOC_TASK_CORE_ID        1     // 在核心1上运行
 
 // FOC控制任务全局变量
@@ -258,6 +261,9 @@ static void foc_control_task(void* arg)
     // 初始化FOC开环控制模式
     foc_openloop_params_t openloop_params = {
         .voltage_magnitude = EXAMPLE_MOTOR_MAX_VOLTAGE,
+        .resistance = EXAMPLE_MOTOR_RESISTANCE,
+        .supply_voltage = EXAMPLE_MOTOR_SUPPLY_VOLTAGE,
+        .kv = EXAMPLE_MOTOR_KV,
         .current_limit = EXAMPLE_MOTOR_CURRENT_LIMIT,
         .speed_rpm = EXAMPLE_MOTOR_OPENLOOP_RPM,
         .pole_pairs = EXAMPLE_MOTOR_POLE_PAIRS,
@@ -394,7 +400,7 @@ static void foc_control_task(void* arg)
                     .duty_v = ol_state->duty_v,
                     .duty_w = ol_state->duty_w,
                     .speed_rpm = params->speed_rpm,
-                    .test_data = ol_state->target_speed_elec,
+                    .test_data = _IQtoF(electrical_angle_iq),
                     .test_data2 = ol_state->angle_elec,
 #else
                     .duty_u = cl_state->duty_u,
@@ -411,8 +417,8 @@ static void foc_control_task(void* arg)
                     .current_v = g_current_reading.current_v,
                     .current_w = g_current_reading.current_w,
 #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
-                    .d_current = _IQtoF(dq_currents.d), 
-                    .q_current = _IQtoF(dq_currents.q)
+                    .d_current = - _IQtoF(dq_currents.d), 
+                    .q_current = - _IQtoF(dq_currents.q)
 #else
                     .d_current = cl_state->id,
                     .q_current = cl_state->iq
