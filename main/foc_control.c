@@ -61,7 +61,7 @@ esp_err_t foc_openloop_init(const foc_openloop_params_t *params, foc_openloop_st
 }
 
 
-esp_err_t foc_openloop_set_target(float speed_rpm)
+esp_err_t foc_openloop_set_targetSpeed(float speed_rpm)
 {
     if (!s_is_initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -69,6 +69,17 @@ esp_err_t foc_openloop_set_target(float speed_rpm)
     
     s_openloop_params.speed_rpm = speed_rpm;
     ESP_LOGI(TAG, "设置转速为 %.2f RPM", speed_rpm);
+    return ESP_OK;
+}
+
+esp_err_t foc_openloop_set_targetVoltage(float voltage_magnitude)
+{
+    if (!s_is_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_openloop_params.voltage_magnitude = voltage_magnitude;
+    ESP_LOGI(TAG, "设置电压幅值为 %.2f", voltage_magnitude);
     return ESP_OK;
 }
 

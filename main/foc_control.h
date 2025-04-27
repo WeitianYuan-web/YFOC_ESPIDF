@@ -137,7 +137,15 @@ esp_err_t foc_openloop_init(const foc_openloop_params_t *params, foc_openloop_st
  * @return esp_err_t ESP_OK成功，其他失败
  */
 
-esp_err_t foc_openloop_set_target(float speed_rpm);
+esp_err_t foc_openloop_set_targetSpeed(float speed_rpm);
+
+/**
+ * @brief 设置电压幅值
+ * 
+ * @param voltage_magnitude 目标电压幅值(0.0-1.0)
+ * @return esp_err_t ESP_OK成功，其他失败
+ */
+esp_err_t foc_openloop_set_targetVoltage(float voltage_magnitude);
 
 /**
  * @brief 执行FOC开环控制并直接输出PWM

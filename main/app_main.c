@@ -15,14 +15,15 @@
 #include "driver/uart.h"
 #include "as5600.h"
 #include "motor_current_sense.h"   // 添加电流采样库头文件
+#include "uart_command.h"
 
 // 选择FOC控制模式：FOC_CONTROL_OPENLOOP为开环控制，FOC_CONTROL_CLOSEDLOOP为闭环控制
 #define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_OPENLOOP
-
+#define FOC_CONTROL_MODE_DEBUG     0
 // 控制模式定义
 #define FOC_CONTROL_OPENLOOP       0
 #define FOC_CONTROL_CLOSEDLOOP     1
-
+ 
 static const char *TAG = "example_foc";
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -87,12 +88,19 @@ bool inverter_update_cb(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data
 uint32_t last_update_time = 0;
 uint32_t dt = 0;
 
-// 定义FOC任务常量
+#if FOC_CONTROL_MODE_DEBUG == 1  // 修正拼写错误
+// Debug模式配置
 #define FOC_TASK_STACK_SIZE     8192
 #define FOC_TASK_PRIORITY       5
-#define FOC_CONTROL_FREQ_HZ     4000  // 4kHz控制频率
-#define FOC_TASK_CORE_ID        1     // 在核心1上运行
-
+#define FOC_CONTROL_FREQ_HZ     2500  // 2.5kHz控制频率
+#define FOC_TASK_CORE_ID        1
+#else
+// 非Debug模式配置
+#define FOC_TASK_STACK_SIZE     8192
+#define FOC_TASK_PRIORITY       5
+#define FOC_CONTROL_FREQ_HZ     8000  // 8kHz控制频率
+#define FOC_TASK_CORE_ID        1
+#endif
 // FOC控制任务全局变量
 static TaskHandle_t foc_task_handle = NULL;
 static SemaphoreHandle_t foc_timer_semaphore = NULL;
@@ -139,7 +147,56 @@ typedef struct {
 // 全局队列句柄
 static QueueHandle_t uart_queue = NULL;
 
-// 串口通信任务
+// 定义UART命令回调函数
+static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_data)
+{
+    switch (cmd_type) {
+        case UART_CMD_TYPE_A:
+            // 处理'a'类型命令 - 设置速度
+            ESP_LOGI(TAG, "设置参数a为: %d", value);
+            
+            #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+            // 如果是开环模式，设置转速
+            foc_openloop_set_targetSpeed(value);
+            ESP_LOGI(TAG, "设置开环转速为: %d RPM", value);
+            #else
+            // 如果是闭环模式，设置速度目标
+            foc_closedloop_set_target(FOC_CONTROL_MODE_VELOCITY, value);
+            ESP_LOGI(TAG, "设置闭环速度为: %d rad/s", value);
+            #endif
+            break;
+            
+        case UART_CMD_TYPE_B:
+            // 处理'b'类型命令
+            ESP_LOGI(TAG, "设置参数b为: %d", value);
+            // 这里添加对b命令的具体处理
+            break;
+            
+        case UART_CMD_TYPE_V:
+            // 处理电压命令
+            {
+                float voltage = value / 100.0f;
+                if (voltage >= 0.0f && voltage <= 1.0f) {
+                    #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                    foc_openloop_set_targetVoltage(voltage);
+                    ESP_LOGI(TAG, "设置开环电压为: %.2f", voltage);
+                    #else
+                    //foc_closedloop_set_target(FOC_CONTROL_MODE_TORQUE, voltage);
+                    ESP_LOGI(TAG, "设置闭环电压为: %.2f", voltage);
+                    #endif
+                } else {
+                    ESP_LOGW(TAG, "电压值超出范围 (0.0-1.0): %.2f", voltage);
+                }
+            }
+            break;
+            
+        default:
+            ESP_LOGW(TAG, "未知命令类型: %c", cmd_type);
+            break;
+    }
+}
+
+// 修改串口通信任务
 static void uart_communication_task(void* arg)
 {
     uart_data_packet_t data;
@@ -148,11 +205,27 @@ static void uart_communication_task(void* arg)
     
     ESP_LOGI(TAG, "串口通信任务已启动在核心%d上", UART_TASK_CORE_ID);
     
+    // 初始化UART命令处理器
+    uart_cmd_config_t cmd_config = {
+        .uart_port = UART_NUM,
+        .rx_buffer_size = 128,
+        .callback = uart_cmd_handler,
+        .user_data = NULL
+    };
+    
+    esp_err_t ret = uart_cmd_init(&cmd_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART命令处理器初始化失败: %d", ret);
+    }
+    
     while (true) {
-        // 从队列接收数据，等待最多100ms
-        if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 处理串口命令
+        uart_cmd_process(10); // 10ms超时
+        
+        // 从队列接收数据，等待最多50ms
+        if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(50)) == pdTRUE) {
             // 发送数据到串口
-            float uart_buffer[17]; // 增加两个元素存放编码器数据
+            float uart_buffer[17];
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
@@ -170,6 +243,7 @@ static void uart_communication_task(void* arg)
             uart_buffer[14] = data.q_current;
             uart_buffer[15] = data.test_data;
             uart_buffer[16] = data.test_data2;
+            
             // 发送数据
             uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 17);
             
@@ -185,9 +259,6 @@ static void uart_communication_task(void* arg)
                          data.speed_rpm, data.encoder_speed, data.voltage, data.encoder_angle);
             }
         }
-        
-        // 无数据时也可以执行其他低优先级任务
-        // vTaskDelay(1); // 可选的短暂延时让出CPU
     }
 }
 
@@ -271,7 +342,7 @@ static void foc_control_task(void* arg)
         .direction = EXAMPLE_MOTOR_DIRECTION,
     };
     foc_openloop_init(&openloop_params, NULL);
-    foc_openloop_set_target(EXAMPLE_MOTOR_OPENLOOP_RPM);
+    foc_openloop_set_targetSpeed(EXAMPLE_MOTOR_OPENLOOP_RPM);
     ESP_LOGI(TAG, "FOC开环控制初始化完成，设置转速: %d RPM", EXAMPLE_MOTOR_OPENLOOP_RPM);
 #else
     // 初始化FOC闭环控制模式
@@ -341,9 +412,9 @@ static void foc_control_task(void* arg)
         if (xSemaphoreTake(foc_timer_semaphore, portMAX_DELAY) == pdTRUE) {
             dt = esp_timer_get_time() - last_update_time;
             last_update_time = esp_timer_get_time();
+            #if FOC_CONTROL_MODE_DEBUG == 1
             as5600_set_dt(dt / 1000000.0f);
-            
-            // 更新编码器数据
+                        // 更新编码器数据
             as5600_update();  
             
             _iq electrical_angle_iq = as5600_get_electrical_angle_iq(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION);
@@ -362,13 +433,40 @@ static void foc_control_task(void* arg)
                 .v = _IQ(g_current_reading.current_v),
                 .w = _IQ(g_current_reading.current_w)
             };
+
+            #endif
             
 #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+
+            #if FOC_CONTROL_MODE_DEBUG == 1
             foc_dq_coord_t dq_currents;
             // 执行FOC开环控制
             float angle_elec = foc_openloop_output(inverter);
             foc_calculate_dq_current(&phase_currents, _IQ(angle_elec), &dq_currents);
-#else
+            #else
+             foc_openloop_output(inverter);
+            #endif
+#else       
+            as5600_set_dt(dt / 1000000.0f);
+                        // 更新编码器数据
+            as5600_update();  
+            
+            _iq electrical_angle_iq = as5600_get_electrical_angle_iq(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION);
+
+            // 读取电流数据（使用10ms超时）
+            if (g_current_sense_initialized) {
+                esp_err_t ret = current_sense_read(&g_current_reading, 10);
+                if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
+                    ESP_LOGW(TAG, "读取电流值失败: %d", ret);
+                }
+            }
+            
+            // 创建电流和角度数据结构
+            foc_uvw_coord_t phase_currents = {
+                .u = _IQ(g_current_reading.current_u),
+                .v = _IQ(g_current_reading.current_v),
+                .w = _IQ(g_current_reading.current_w)
+            };
             // 更新闭环控制的速度和位置状态
             float velocity = as5600_get_speed_rad();
             float position = as5600_get_position();
@@ -400,29 +498,28 @@ static void foc_control_task(void* arg)
                     .duty_v = ol_state->duty_v,
                     .duty_w = ol_state->duty_w,
                     .speed_rpm = params->speed_rpm,
+                    .voltage = params->voltage_magnitude,
+#if FOC_CONTROL_MODE_DEBUG == 1
                     .test_data = _IQtoF(electrical_angle_iq),
                     .test_data2 = ol_state->angle_elec,
+                    .d_current = - _IQtoF(dq_currents.d), 
+                    .q_current = - _IQtoF(dq_currents.q),
+#endif
 #else
                     .duty_u = cl_state->duty_u,
                     .duty_v = cl_state->duty_v,
                     .duty_w = cl_state->duty_w,
                     .speed_rpm = as5600_get_speed_rpm(),
+                    .d_current = cl_state->id,
+                    .q_current = cl_state->iq,
 #endif
-                    .voltage = EXAMPLE_MOTOR_MAX_VOLTAGE,
                     .encoder_angle = as5600_get_position(),
                     .encoder_speed = as5600_get_speed_rpm(),
                     .total_angle_raw = as5600_get_total_angle_raw(),
                     .full_rotations = as5600_get_full_rotations(),
                     .current_u = g_current_reading.current_u,
                     .current_v = g_current_reading.current_v,
-                    .current_w = g_current_reading.current_w,
-#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
-                    .d_current = - _IQtoF(dq_currents.d), 
-                    .q_current = - _IQtoF(dq_currents.q)
-#else
-                    .d_current = cl_state->id,
-                    .q_current = cl_state->iq
-#endif
+                    .current_w = g_current_reading.current_w
                 };
                 
                 // 发送数据到队列，不等待(非阻塞)
@@ -457,12 +554,6 @@ void app_main(void)
     // counting semaphore used to sync update foc calculation when mcpwm timer updated
     SemaphoreHandle_t update_semaphore = xSemaphoreCreateCounting(1, 0);
 
-    foc_dq_coord_t dq_out = {_IQ(0), _IQ(0)};
-    foc_ab_coord_t ab_out;
-    foc_uvw_coord_t uvw_out;
-    int uvw_duty[3];
-    float elec_theta_deg = 0;
-    _iq elec_theta_rad;
     
     // 配置UART
     uart_config_t uart_config = {
@@ -475,8 +566,9 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_TXD, UART_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 1024, 0, 0, NULL, 0));
-    ESP_LOGI(TAG, "UART初始化完成");
+    // 安装驱动程序，启用收发缓冲区
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 1024, 1024, 0, NULL, 0));
+    ESP_LOGI(TAG, "UART初始化完成，启用收发功能");
 
     inverter_config_t cfg = {
         .timer_config = {
