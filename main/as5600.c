@@ -282,24 +282,24 @@ esp_err_t as5600_update(void) {
     // 计算角速度 (弧度/秒) (IQ格式)
     g_as5600.velocity_rad_per_sec_iq = _IQdiv(angle_diff_iq, g_as5600.dt_iq);
     
-    // 计算RPM (RPM = rad/s * 60 / 2π) (IQ格式)
-    g_as5600.velocity_rpm_iq = _IQmpy(g_as5600.velocity_rad_per_sec_iq, _RPM_SCALE_IQ);
-    
-    // 应用低通滤波 - 优化IQ计算
+        // 应用低通滤波 - 优化IQ计算
     _iq alpha = _IQ(0.02); // 滤波系数
     
     if (g_as5600.initialized == 1) {
         // 第一次运行，初始化滤波值
-        g_as5600.velocity_filtered_iq = g_as5600.velocity_rpm_iq;
+        g_as5600.velocity_filtered_iq = g_as5600.velocity_rad_per_sec_iq;
         g_as5600.initialized = 2;
     } else {
         // 应用滤波 (IQ格式)
         g_as5600.velocity_filtered_iq = low_pass_filter_iq(
-            g_as5600.velocity_rpm_iq,
+            g_as5600.velocity_rad_per_sec_iq,
             g_as5600.velocity_filtered_iq,
             alpha
         );
     }
+    // 计算RPM (RPM = rad/s * 60 / 2π) (IQ格式)
+    g_as5600.velocity_rpm_iq = _IQmpy(g_as5600.velocity_filtered_iq, _RPM_SCALE_IQ);
+    
     
     return ret; // 返回读取结果，即使出错也完成了计算
 }
@@ -325,9 +325,11 @@ float as5600_get_electrical_angle(int pole_pairs) {
 }
 
 // 获取电角度 (IQ格式) - 新接口
-_iq as5600_get_electrical_angle_iq(int pole_pairs) {
+_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction) {
     _iq pole_pairs_iq = _IQ(pole_pairs);
+    _iq direction_iq = _IQ(direction);
     _iq elec_angle_iq = _IQmpy(g_as5600.rotor_phy_angle_iq, pole_pairs_iq);
+    elec_angle_iq = _IQmpy(elec_angle_iq, direction_iq);
     
     // 确保角度在[0, 2π)范围内
     while (_IQtoF(elec_angle_iq) >= _IQtoF(_2PI_IQ)) {
@@ -341,9 +343,14 @@ _iq as5600_get_electrical_angle_iq(int pole_pairs) {
 }
 
 // 获取转速 (浮点格式，兼容原接口)
-float as5600_get_speed(void) {
+float as5600_get_speed_rad(void) {
     return _IQtoF(g_as5600.velocity_filtered_iq);
 } 
+
+// 获取转速(RPM)
+float as5600_get_speed_rpm(void) {
+    return _IQtoF(g_as5600.velocity_rpm_iq);
+}
 
 // 获取总角度原始值
 int32_t as5600_get_total_angle_raw(void) {

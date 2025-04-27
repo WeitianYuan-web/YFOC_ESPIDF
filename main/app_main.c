@@ -16,14 +16,21 @@
 #include "as5600.h"
 #include "motor_current_sense.h"   // 添加电流采样库头文件
 
+// 选择FOC控制模式：FOC_CONTROL_OPENLOOP为开环控制，FOC_CONTROL_CLOSEDLOOP为闭环控制
+#define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_OPENLOOP
+
+// 控制模式定义
+#define FOC_CONTROL_OPENLOOP       0
+#define FOC_CONTROL_CLOSEDLOOP     1
+
 static const char *TAG = "example_foc";
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////// Please update the following configuration according to your HardWare spec /////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 #define EXAMPLE_FOC_DRV_EN_GPIO          12
-#define EXAMPLE_FOC_PWM_U_GPIO           33
-#define EXAMPLE_FOC_PWM_V_GPIO           32
+#define EXAMPLE_FOC_PWM_U_GPIO           32
+#define EXAMPLE_FOC_PWM_V_GPIO           33
 #define EXAMPLE_FOC_PWM_W_GPIO           25
 
 // UART配置
@@ -36,13 +43,15 @@ static const char *TAG = "example_foc";
 #define EXAMPLE_FOC_MCPWM_PERIOD              2000     // 2000 * 0.05us = 100us, 10KHz
 
 // 电流采样引脚配置
-#define CURRENT_SENSE_U_PIN 39  // U相电流采样GPIO39
-#define CURRENT_SENSE_V_PIN 36  // V相电流采样GPIO36
+#define CURRENT_SENSE_U_PIN 39  
+#define CURRENT_SENSE_V_PIN 36  
 
 // 电机参数
 #define EXAMPLE_MOTOR_POLE_PAIRS          7   // 电机极对数
-#define EXAMPLE_MOTOR_MAX_VOLTAGE         0.8 // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
-#define EXAMPLE_MOTOR_OPENLOOP_RPM        8000 // 开环控制转速 (RPM)
+#define EXAMPLE_MOTOR_DIRECTION           -1  // 电机方向
+#define EXAMPLE_MOTOR_CURRENT_LIMIT      1.0f // 电流限制(安培)
+#define EXAMPLE_MOTOR_MAX_VOLTAGE         0.9 // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
+#define EXAMPLE_MOTOR_OPENLOOP_RPM        400 // 开环控制转速 (RPM)
 
 // AS5600编码器配置
 #define AS5600_SDA_PIN      19      // SDA引脚
@@ -120,6 +129,8 @@ typedef struct {
     float current_w;         // W相电流(安培)
     float d_current;         // d轴电流(安培)
     float q_current;         // q轴电流(安培)
+    float test_data;         // 测试数据
+    float test_data2;        // 测试数据2
 } uart_data_packet_t;
 
 // 全局队列句柄
@@ -138,7 +149,7 @@ static void uart_communication_task(void* arg)
         // 从队列接收数据，等待最多100ms
         if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
             // 发送数据到串口
-            float uart_buffer[15]; // 增加两个元素存放编码器数据
+            float uart_buffer[17]; // 增加两个元素存放编码器数据
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
@@ -154,9 +165,10 @@ static void uart_communication_task(void* arg)
             uart_buffer[12] = data.current_w;
             uart_buffer[13] = data.d_current;
             uart_buffer[14] = data.q_current;
-
+            uart_buffer[15] = data.test_data;
+            uart_buffer[16] = data.test_data2;
             // 发送数据
-            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 15);
+            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 17);
             
             // 发送帧尾
             uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f};
@@ -181,9 +193,10 @@ static void foc_control_task(void* arg)
 {
     inverter_handle_t inverter = (inverter_handle_t)arg;
     
-    // 获取FOC参数
-    foc_openloop_params_t* params = foc_openloop_get_params();
     uint8_t count = 0;
+    
+    // 状态输出时间控制
+    uint32_t last_print_time = 0;
     
     // 初始化电流采样模块（如果尚未初始化）
     if (!g_current_sense_initialized) {
@@ -241,6 +254,82 @@ static void foc_control_task(void* arg)
         }
     }
     
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+    // 初始化FOC开环控制模式
+    foc_openloop_params_t openloop_params = {
+        .voltage_magnitude = EXAMPLE_MOTOR_MAX_VOLTAGE,
+        .current_limit = EXAMPLE_MOTOR_CURRENT_LIMIT,
+        .speed_rpm = EXAMPLE_MOTOR_OPENLOOP_RPM,
+        .pole_pairs = EXAMPLE_MOTOR_POLE_PAIRS,
+        .period = EXAMPLE_FOC_MCPWM_PERIOD,
+        .direction = EXAMPLE_MOTOR_DIRECTION,
+    };
+    foc_openloop_init(&openloop_params, NULL);
+    foc_openloop_set_target(EXAMPLE_MOTOR_OPENLOOP_RPM);
+    ESP_LOGI(TAG, "FOC开环控制初始化完成，设置转速: %d RPM", EXAMPLE_MOTOR_OPENLOOP_RPM);
+#else
+    // 初始化FOC闭环控制模式
+    foc_closedloop_params_t closedloop_params = {
+        .pole_pairs = EXAMPLE_MOTOR_POLE_PAIRS,
+        .direction = EXAMPLE_MOTOR_DIRECTION,
+        .period = EXAMPLE_FOC_MCPWM_PERIOD,
+        .current_limit = EXAMPLE_MOTOR_CURRENT_LIMIT,          
+        .voltage_limit = EXAMPLE_MOTOR_MAX_VOLTAGE,
+        .dt = 1.0f / FOC_CONTROL_FREQ_HZ, // 控制周期
+        
+        // 使用速度控制模式 - 与下方set_target保持一致
+        .control_mode = FOC_CONTROL_MODE_VELOCITY,
+        
+        .invert_phase_order = false,
+        
+        .target_iq = 0.0f,              // 初始q轴电流为0
+        .target_id = 0.0f,              // d轴电流目标为0
+        
+        // 设置电流低通滤波系数 (0.05表示新值占5%，旧值占95%)
+        .current_filter_alpha = 0.05f,   // 较小的值滤波效果更强
+        
+        // 初始化电流PI控制器
+        .id_pi = {
+            .kp = 0.3f,     // 为d轴添加控制，保持在0电流
+            .ki = 5.0f,     // 适当的积分系数
+            .output_limit = EXAMPLE_MOTOR_MAX_VOLTAGE,
+            .integral = 0.0f
+        },
+        .iq_pi = {
+            .kp = 0.5f,
+            .ki = 20.0f,    // 增加积分系数提高响应性
+            .output_limit = EXAMPLE_MOTOR_MAX_VOLTAGE,
+            .integral = 0.0f
+        },
+        
+        // 速度和位置控制器参数
+        .velocity_pi = {
+            .kp = 0.1f,    // 增大比例系数
+            .ki = 0.2f,     // 增大积分系数
+            .output_limit = 10.0f,
+            .integral = 0.0f
+        },
+        .position_pi = {
+            .kp = 1.0f,
+            .ki = 0.1f,
+            .output_limit = 20.0f,
+            .integral = 0.0f
+        }
+    };
+    
+    // 初始化闭环控制
+    esp_err_t ret = foc_closedloop_init(&closedloop_params, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "初始化FOC闭环控制失败: %d", ret);
+    } else {
+        ESP_LOGI(TAG, "FOC闭环控制初始化完成");
+    }
+    
+    // 设置速度目标为10 rad/s
+    foc_closedloop_set_target(FOC_CONTROL_MODE_VELOCITY, 10);
+    ESP_LOGI(TAG, "设置速度目标: 10 rad/s，开始闭环控制");
+#endif
+
     while (true) {
         // 等待定时器触发
         if (xSemaphoreTake(foc_timer_semaphore, portMAX_DELAY) == pdTRUE) {
@@ -251,7 +340,7 @@ static void foc_control_task(void* arg)
             // 更新编码器数据
             as5600_update();  
             
-            _iq electrical_angle_iq = as5600_get_electrical_angle_iq(params->pole_pairs);
+            _iq electrical_angle_iq = as5600_get_electrical_angle_iq(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION);
 
             // 读取电流数据（使用10ms超时）
             if (g_current_sense_initialized) {
@@ -260,58 +349,96 @@ static void foc_control_task(void* arg)
                     ESP_LOGW(TAG, "读取电流值失败: %d", ret);
                 }
             }
-
+            
+            // 创建电流和角度数据结构
             foc_uvw_coord_t phase_currents = {
                 .u = _IQ(g_current_reading.current_u),
                 .v = _IQ(g_current_reading.current_v),
                 .w = _IQ(g_current_reading.current_w)
             };
-            _iq electrical_angle = as5600_get_electrical_angle_iq(params->pole_pairs);
-
-            // 计算d-q轴电流
-            foc_dq_coord_t dq_currents;
-            foc_calculate_dq_current(&phase_currents, electrical_angle, &dq_currents);
-
-            // 执行FOC控制 (当前仍为开环)
-            foc_openloop_output(inverter, params);
             
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+            foc_dq_coord_t dq_currents;
+            // 执行FOC开环控制
+            float angle_elec = foc_openloop_output(inverter);
+            foc_calculate_dq_current(&phase_currents, _IQ(angle_elec), &dq_currents);
+#else
+            // 更新闭环控制的速度和位置状态
+            float velocity = as5600_get_speed_rad();
+            float position = as5600_get_position();
+            foc_closedloop_set_motion_state(velocity, position);
+            
+            // 执行FOC闭环控制
+            foc_closedloop_output(inverter, &phase_currents, electrical_angle_iq);
+#endif
+            
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+            // 获取开环控制状态
+            foc_openloop_state_t *ol_state = foc_openloop_get_state();
+            // 获取FOC参数
+            foc_openloop_params_t* params = foc_openloop_get_params();
+#else
+            // 获取闭环控制状态
+            foc_closedloop_state_t *cl_state = foc_closedloop_get_state();
+#endif
 
             // 每100次循环(约50ms)向串口任务发送一次数据
             if (count >= 100) {
                 count = 0;
                 
-                // 获取当前状态
-                foc_openloop_state_t *state = foc_openloop_get_state();
-                
-                // 准备数据包 - 使用优化后的IQ版本，但保持接口兼容性
+                // 准备数据包
                 uart_data_packet_t data = {
                     .timestamp = dt,
-                    .duty_u = state->duty_u,
-                    .duty_v = state->duty_v,
-                    .duty_w = state->duty_w,
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                    .duty_u = ol_state->duty_u, 
+                    .duty_v = ol_state->duty_v,
+                    .duty_w = ol_state->duty_w,
                     .speed_rpm = params->speed_rpm,
-                    .voltage = params->voltage_magnitude,
+                    .test_data = ol_state->target_speed_elec,
+                    .test_data2 = ol_state->angle_elec,
+#else
+                    .duty_u = cl_state->duty_u,
+                    .duty_v = cl_state->duty_v,
+                    .duty_w = cl_state->duty_w,
+                    .speed_rpm = as5600_get_speed_rpm(),
+#endif
+                    .voltage = EXAMPLE_MOTOR_MAX_VOLTAGE,
                     .encoder_angle = as5600_get_position(),
-                    .encoder_speed = as5600_get_speed(),
+                    .encoder_speed = as5600_get_speed_rpm(),
                     .total_angle_raw = as5600_get_total_angle_raw(),
                     .full_rotations = as5600_get_full_rotations(),
                     .current_u = g_current_reading.current_u,
                     .current_v = g_current_reading.current_v,
                     .current_w = g_current_reading.current_w,
-                    .d_current = _IQtoF(dq_currents.d),
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                    .d_current = _IQtoF(dq_currents.d), 
                     .q_current = _IQtoF(dq_currents.q)
+#else
+                    .d_current = cl_state->id,
+                    .q_current = cl_state->iq
+#endif
                 };
-                
-/*                 // 如果电流采样已初始化，则打印电流信息
-                if (g_current_sense_initialized) {
-                    ESP_LOGI(TAG, "电流读数: U相=%.3fA, V相=%.3fA, W相=%.3fA",
-                            g_current_reading.current_u,
-                            g_current_reading.current_v,
-                            g_current_reading.current_w);
-                } */
                 
                 // 发送数据到队列，不等待(非阻塞)
                 xQueueSendToBack(uart_queue, &data, 0);
+                
+                // 添加控制状态打印（仅每秒一次）
+                uint32_t current_time = esp_timer_get_time() / 1000; // 转换为毫秒
+                if (current_time - last_print_time > 1000) {
+                    last_print_time = current_time;
+                    
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                    /* ESP_LOGI(TAG, "开环控制状态: 设定速度=%.1f RPM, 电压=%.2f",
+                             (float)EXAMPLE_MOTOR_OPENLOOP_RPM, EXAMPLE_MOTOR_MAX_VOLTAGE); */
+#else
+                    // 计算力矩和功率估计值
+                    float torque_est = cl_state->iq * 0.1f; // 假设转矩常数为0.1 Nm/A
+                    float power_est = torque_est * velocity; // 机械功率 = 转矩 * 角速度
+                    
+                    ESP_LOGI(TAG, "闭环控制状态: 速度=%.1f rad/s, Id=%.2fA, Iq=%.2fA, 估计转矩=%.2f Nm, 估计功率=%.2f W",
+                             velocity, cl_state->id, cl_state->iq, torque_est, power_est);
+#endif
+                }
             }
             count++;
         }
@@ -383,23 +510,17 @@ void app_main(void)
     ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_START_NO_STOP));
     ESP_LOGI(TAG, "Inverter start OK");
 
-    // 初始化开环控制
-    foc_openloop_params_t openloop_params = {
-        .voltage_magnitude = EXAMPLE_MOTOR_MAX_VOLTAGE,
-        .speed_rpm = EXAMPLE_MOTOR_OPENLOOP_RPM,  // 初始速度设为0
-        .pole_pairs = EXAMPLE_MOTOR_POLE_PAIRS,
-        .period = EXAMPLE_FOC_MCPWM_PERIOD,
-    };
-    ESP_ERROR_CHECK(foc_openloop_init(&openloop_params, NULL));
-
-    extern foc_openloop_state_t* foc_openloop_get_state(void);
 
     // Enable gate driver chip
     bsp_bridge_driver_init();
     bsp_bridge_driver_enable(true);
 
     ESP_LOGI(TAG, "Start FOC");
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
     ESP_LOGI(TAG, "使用FOC开环控制模式");
+#else
+    ESP_LOGI(TAG, "使用FOC闭环控制模式");
+#endif
     
     // 创建FOC控制定时器信号量
     foc_timer_semaphore = xSemaphoreCreateBinary();

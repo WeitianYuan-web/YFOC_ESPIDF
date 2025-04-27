@@ -103,14 +103,21 @@ float as5600_get_electrical_angle(int pole_pairs);
  * @param pole_pairs 电机极对数
  * @return _iq 电角度(弧度，IQ格式)
  */
-_iq as5600_get_electrical_angle_iq(int pole_pairs);
+_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction);
 
 /**
  * @brief 获取转速
  * 
+ * @return float 转速(rad/s)
+ */
+float as5600_get_speed_rad(void);
+
+/**
+ * @brief 获取转速(RPM)
+ * 
  * @return float 转速(RPM)
  */
-float as5600_get_speed(void); 
+float as5600_get_speed_rpm(void);
 
 /**
  * @brief 获取总角度原始值
