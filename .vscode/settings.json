@@ -15,6 +15,7 @@
         "esp_adc_cal.h": "c",
         "esp_err.h": "c",
         "adc_continuous.h": "c",
-        "esp_foc.h": "c"
+        "esp_foc.h": "c",
+        "esp_timer.h": "c"
     }
 }

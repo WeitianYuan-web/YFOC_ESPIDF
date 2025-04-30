@@ -16,6 +16,7 @@
 #include "as5600.h"
 #include "motor_current_sense.h"   // 添加电流采样库头文件
 #include "uart_command.h"
+#include "motor_config.h"  // 添加电机配置头文件
 
 // 选择FOC控制模式：FOC_CONTROL_OPENLOOP为开环控制，FOC_CONTROL_CLOSEDLOOP为闭环控制
 #define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_OPENLOOP
@@ -47,15 +48,18 @@ static const char *TAG = "example_foc";
 #define CURRENT_SENSE_U_PIN 39  
 #define CURRENT_SENSE_V_PIN 36  
 
-// 电机参数
-#define EXAMPLE_MOTOR_POLE_PAIRS          7   // 电机极对数
-#define EXAMPLE_MOTOR_RESISTANCE          9.2f // 电机相电阻(欧姆)
-#define EXAMPLE_MOTOR_SUPPLY_VOLTAGE      12.0f // 电机供电电压(伏特)
-#define EXAMPLE_MOTOR_KV                  180.0f // 电机KV值(RPM/V)
-#define EXAMPLE_MOTOR_DIRECTION           -1  // 电机方向
-#define EXAMPLE_MOTOR_CURRENT_LIMIT      2.0f // 电流限制(安培)
-#define EXAMPLE_MOTOR_MAX_VOLTAGE         0.9 // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
-#define EXAMPLE_MOTOR_OPENLOOP_RPM        400 // 开环控制转速 (RPM)
+// 获取当前电机配置
+static const motor_config_t* motor_config;
+
+// 使用电机配置中的参数替换原有的宏定义
+#define EXAMPLE_MOTOR_POLE_PAIRS          (motor_config->pole_pairs)
+#define EXAMPLE_MOTOR_RESISTANCE          (motor_config->resistance)
+#define EXAMPLE_MOTOR_SUPPLY_VOLTAGE      (motor_config->supply_voltage)
+#define EXAMPLE_MOTOR_KV                  (motor_config->kv)
+#define EXAMPLE_MOTOR_DIRECTION           (motor_config->direction)
+#define EXAMPLE_MOTOR_CURRENT_LIMIT       (motor_config->current_limit)
+#define EXAMPLE_MOTOR_MAX_VOLTAGE         (motor_config->max_voltage)
+#define EXAMPLE_MOTOR_OPENLOOP_RPM        (motor_config->openloop_rpm)
 
 // AS5600编码器配置
 #define AS5600_SDA_PIN      19      // SDA引脚
@@ -551,6 +555,11 @@ static void foc_control_task(void* arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Hello FOC");
+    
+    // 初始化电机配置
+    motor_config = get_motor_config();
+    ESP_LOGI(TAG, "使用电机配置: %s", motor_config->name);
+    
     // counting semaphore used to sync update foc calculation when mcpwm timer updated
     SemaphoreHandle_t update_semaphore = xSemaphoreCreateCounting(1, 0);
 
