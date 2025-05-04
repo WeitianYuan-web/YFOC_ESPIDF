@@ -75,6 +75,9 @@ typedef struct {
     int direction;               // 电机方向
     int period;                  // PWM周期
     float current_limit;         // 电流限制(安培)
+    float supply_voltage;        // 电机供电电压(伏特)
+    float kv;                    // 电机KV值(RPM/V)
+    float resistance;            // 电机相电阻(欧姆)
     float voltage_limit;         // 电压限制(0.0-1.0)
     float dt;                    // 控制周期(秒)
     
@@ -120,6 +123,16 @@ typedef struct {
     
     uint64_t timestamp_us;       // 上次更新时间戳(us)
 } foc_closedloop_state_t;
+
+/**
+ * @brief FOC控制目标值结构体
+ */
+typedef struct {
+    foc_control_mode_t control_mode;  ///< 控制模式
+    float target_current;              ///< 目标电流(A)
+    float target_velocity;            ///< 目标速度(rad/s)
+    float target_position;            ///< 目标位置(rad)
+} foc_target_t;
 
 /**
  * @brief 初始化FOC开环控制
@@ -206,7 +219,7 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
  * @param target 目标值(根据模式不同而不同)
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_target(foc_control_mode_t mode, float target);
+esp_err_t foc_closedloop_set_target(const foc_target_t *target);
 
 /**
  * @brief 设置速度和位置

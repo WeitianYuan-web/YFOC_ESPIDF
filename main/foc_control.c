@@ -11,6 +11,9 @@
 #include <stdbool.h>
 #include "esp_timer.h"
 
+
+#define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
+
 static const char *TAG = "foc_control";
 
 // 全局状态变量，如果用户没有提供状态变量，就使用这个
@@ -142,7 +145,11 @@ float foc_openloop_output(inverter_handle_t inverter)
     float kv = s_openloop_params.kv;
     float resistance = s_openloop_params.resistance;
     float voltage_magnitude = s_openloop_params.voltage_magnitude;
-    
+    float max_current = supply_voltage/resistance;
+
+    if(current_limit >= max_current){
+        current_limit = max_current;
+    }
     // 计算反电动势常数（Ke）
     // Ke = 1/(kv * 2π/60) - 将kv(RPM/V)转换为电动势常数(V/(rad/s))
     float ke = 1.0f / (kv * (2.0f * M_PI / 60.0f));
@@ -150,15 +157,15 @@ float foc_openloop_output(inverter_handle_t inverter)
     // 计算反电动势大小
     float bemf = ke * fabsf(p_state->target_speed_elec);
     
-    // 计算电压输出
-    float vd = 0;
-    // q轴电压需要克服反电动势
-    float vq = bemf;
-    
     // 考虑电阻损耗的额外电压
     float v_ir = resistance * current_limit;
-    vq += v_ir;
     
+    // 计算电压输出
+    float vd = 0;
+
+    // q轴电压需要克服反电动势
+    float vq = bemf + v_ir;
+
     // 确保不超过电压限制
     float v_magnitude = sqrtf(vd*vd + vq*vq);
     float v_limit = supply_voltage * voltage_magnitude;
@@ -170,18 +177,12 @@ float foc_openloop_output(inverter_handle_t inverter)
         vq *= scale;
     }
     
-    // 根据电压反推电流（I=V/R，简化模型）
-    float id = vd / resistance;
-    float iq = vq / resistance;
     
-    // 确保电流不超过限制
-    float i_magnitude = sqrtf(id*id + iq*iq);
-    if (i_magnitude > current_limit) {
-        float i_scale = current_limit / i_magnitude;
-        id *= i_scale;
-        iq *= i_scale;
-    }
-
+    float id = vd / supply_voltage ;
+    float iq = vq / supply_voltage;
+    
+    id = _constrain(id, -current_limit/max_current, current_limit/max_current);
+    iq = _constrain(iq, -current_limit/max_current, current_limit/max_current);
     // 设置dq电流输出
     foc_dq_coord_t dq_out;
     dq_out.d = _IQ(id);
@@ -197,9 +198,12 @@ float foc_openloop_output(inverter_handle_t inverter)
     
     // 转换为占空比值
     int uvw_duty[3]; //占空比范围为0-1000
-    uvw_duty[0] = _IQtoF(_IQmpy(_IQmpy(_IQ(s_openloop_params.voltage_magnitude), _IQdiv2(uvw_out.u)), _IQ(s_openloop_params.period/4))) + (s_openloop_params.period / 4);
-    uvw_duty[1] = _IQtoF(_IQmpy(_IQmpy(_IQ(s_openloop_params.voltage_magnitude), _IQdiv2(uvw_out.v)), _IQ(s_openloop_params.period/4))) + (s_openloop_params.period / 4);
-    uvw_duty[2] = _IQtoF(_IQmpy(_IQmpy(_IQ(s_openloop_params.voltage_magnitude), _IQdiv2(uvw_out.w)), _IQ(s_openloop_params.period/4))) + (s_openloop_params.period / 4); 
+    // 将IQ数据转换为PWM占空比
+    uvw_duty[0] = (_IQtoF(_IQdiv2(uvw_out.u)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
+    uvw_duty[1] = (_IQtoF(_IQdiv2(uvw_out.v)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
+    uvw_duty[2] = (_IQtoF(_IQdiv2(uvw_out.w)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
+    
+    // 保存相电压数据
     p_state->duty_u = uvw_duty[0];
     p_state->duty_v = uvw_duty[1];
     p_state->duty_w = uvw_duty[2];
@@ -225,24 +229,37 @@ foc_openloop_params_t* foc_openloop_get_params(void)
  * @brief 更新PI控制器
  * 
  * @param pi PI控制器
- * @param error 误差值
- * @param dt 时间增量
- * @return float 控制输出
+ * @param error 误差值 (单位取决于具体应用)
+ * @param dt 时间增量 (秒)
+ * @return float 控制输出 (归一化电压，范围为-1到1)
  */
 static float foc_pi_controller_update(foc_pi_controller_t *pi, float error, float dt)
 {
+    // 参数检查
+    if (!pi || dt <= 0) {
+        ESP_LOGW(TAG, "PI控制器参数无效");
+        return 0.0f;
+    }
+    
     // 计算比例项
     float proportional = pi->kp * error;
     
-    // 更新积分项
-    pi->integral += error * dt;
+    // 计算积分项增量
+    float integral_increment = error * dt;
     
-    // 积分限幅，防止积分饱和
-    if (pi->integral > pi->output_limit) {
-        pi->integral = pi->output_limit;
-    } else if (pi->integral < -pi->output_limit) {
-        pi->integral = -pi->output_limit;
+    // 抗积分饱和处理
+    float max_integral = pi->output_limit / pi->ki;  // 最大积分值
+    float new_integral = pi->integral + integral_increment;
+    
+    // 如果新的积分值会导致输出饱和，则限制积分增量
+    if (fabsf(new_integral) > max_integral) {
+        // 计算允许的最大积分增量
+        float max_increment = (max_integral - fabsf(pi->integral)) * (new_integral > 0 ? 1.0f : -1.0f);
+        integral_increment = max_increment;
     }
+    
+    // 更新积分项
+    pi->integral += integral_increment;
     
     // 计算积分项的贡献
     float integral = pi->ki * pi->integral;
@@ -250,7 +267,7 @@ static float foc_pi_controller_update(foc_pi_controller_t *pi, float error, floa
     // 计算最终输出
     float output = proportional + integral;
     
-    // 输出限幅
+    // 输出限幅 (确保输出在-1到1范围内，除非设置了其他输出限制)
     if (output > pi->output_limit) {
         output = pi->output_limit;
     } else if (output < -pi->output_limit) {
@@ -272,6 +289,14 @@ esp_err_t foc_closedloop_init(const foc_closedloop_params_t *params, foc_closedl
     ESP_RETURN_ON_FALSE(params, ESP_ERR_INVALID_ARG, TAG, "params is NULL");
     ESP_RETURN_ON_FALSE(params->pole_pairs > 0, ESP_ERR_INVALID_ARG, TAG, "pole_pairs must be positive");
     ESP_RETURN_ON_FALSE(params->period > 0, ESP_ERR_INVALID_ARG, TAG, "period must be positive");
+    ESP_RETURN_ON_FALSE(params->voltage_limit > 0 && params->voltage_limit <= 1.0f, 
+                      ESP_ERR_INVALID_ARG, TAG, "voltage_limit must be in range (0, 1]");
+    
+    // 验证PI控制器参数
+    ESP_RETURN_ON_FALSE(params->id_pi.output_limit > 0 && params->id_pi.output_limit <= 1.0f,
+                      ESP_ERR_INVALID_ARG, TAG, "id_pi.output_limit must be in range (0, 1]");
+    ESP_RETURN_ON_FALSE(params->iq_pi.output_limit > 0 && params->iq_pi.output_limit <= 1.0f,
+                      ESP_ERR_INVALID_ARG, TAG, "iq_pi.output_limit must be in range (0, 1]");
     
     if (state) {
         p_cl_state = state;
@@ -286,7 +311,8 @@ esp_err_t foc_closedloop_init(const foc_closedloop_params_t *params, foc_closedl
     memset(p_cl_state, 0, sizeof(foc_closedloop_state_t));
     p_cl_state->timestamp_us = esp_timer_get_time();
     
-    ESP_LOGI(TAG, "FOC闭环控制初始化完成，控制模式: %d", params->control_mode);
+    ESP_LOGI(TAG, "FOC闭环控制初始化完成，控制模式: %d, 电压限制: %.2f", 
+            params->control_mode, params->voltage_limit);
     
     s_cl_is_initialized = true;
     return ESP_OK;
@@ -321,8 +347,17 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
     // 异常保护，防止时间间隔过大或首次调用
     if (dt > 0.5f || dt <= 0) {
         dt = s_closedloop_params.dt;  // 使用默认值
+        ESP_LOGW(TAG, "控制周期异常，使用默认值: %.6f s", dt);
     }
     
+    // 获取电机参数
+    float current_limit = s_closedloop_params.current_limit;
+    float supply_voltage = s_closedloop_params.supply_voltage;
+    float kv = s_closedloop_params.kv;
+    float resistance = s_closedloop_params.resistance;
+    float voltage_limit = s_closedloop_params.voltage_limit;
+    float max_current = supply_voltage/resistance;
+
     // Step 1: 计算d-q轴电流
     foc_dq_coord_t dq_currents;
     foc_calculate_dq_current(phase_currents, electrical_angle, &dq_currents);
@@ -347,56 +382,102 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
     // Step 2: 根据控制模式确定目标值
     float target_id = s_closedloop_params.target_id; // 通常d轴电流目标为0
     float target_iq = s_closedloop_params.target_iq;
+    float target_velocity = s_closedloop_params.target_velocity;
+    float target_position = s_closedloop_params.target_position;
     float vd = 0;
     float vq = 0;
 
-    switch (s_closedloop_params.control_mode)
-    {
-    case FOC_CONTROL_MODE_TORQUE:
-        target_iq = s_closedloop_params.target_iq;
-        // 电流限幅
-        if (target_iq > s_closedloop_params.current_limit)
-        {
-            target_iq = s_closedloop_params.current_limit;
-        }
-        else if (target_iq < -s_closedloop_params.current_limit)
-        {
-            target_iq = -s_closedloop_params.current_limit;
-        }
-
-        // Step 3: 电流PI控制器计算电压输出
-        float id_error = target_id - p_cl_state->id;
-        float iq_error = target_iq - p_cl_state->iq;
-
-        // 电流闭环控制是最内环，直接影响力矩
-        // 这里d轴控制磁链，通常设为0；q轴控制转矩
-        vd = foc_pi_controller_update(&s_closedloop_params.id_pi, id_error, dt);
-        vq = foc_pi_controller_update(&s_closedloop_params.iq_pi, iq_error, dt);
-
-        break;
-    case FOC_CONTROL_MODE_VELOCITY:
-        float velocity_error = s_closedloop_params.target_velocity - p_cl_state->velocity;
-        target_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
-        break;
-    case FOC_CONTROL_MODE_POSITION:
-        float position_error = s_closedloop_params.target_position - p_cl_state->position;
-        float target_velocity = foc_pi_controller_update(&s_closedloop_params.position_pi, position_error, dt);
-        break;
-    case FOC_CONTROL_MODE_TORQUE_VELOCITY:
-        target_iq = s_closedloop_params.target_iq;
-        break;
-    case FOC_CONTROL_MODE_TORQUE_POSITION:
-        target_iq = s_closedloop_params.target_iq;
-        break;
-    case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
-        target_iq = s_closedloop_params.target_iq;
-        break;
+    // 根据控制模式计算目标值
+    switch (s_closedloop_params.control_mode) {
+        case FOC_CONTROL_MODE_TORQUE:
+            // 转矩控制模式：直接使用设定的q轴电流目标值
+            target_iq = s_closedloop_params.target_iq;
+            break;
+            
+        case FOC_CONTROL_MODE_VELOCITY:
+            // 速度控制模式：通过速度PI控制器计算q轴电流目标值
+            {
+                float velocity_error = target_velocity - p_cl_state->velocity;
+                target_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
+            }
+            break;
+            
+        case FOC_CONTROL_MODE_POSITION:
+            // 位置控制模式：通过位置PI控制器计算速度目标，再通过速度PI控制器计算q轴电流目标
+            {
+                float position_error = target_position - p_cl_state->position;
+                target_velocity = foc_pi_controller_update(&s_closedloop_params.position_pi, position_error, dt);
+                float velocity_error = target_velocity - p_cl_state->velocity;
+                target_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
+            }
+            break;
+            
+        case FOC_CONTROL_MODE_TORQUE_VELOCITY:
+            // 转矩速度控制模式：在转矩控制基础上增加速度限制
+            {
+                float velocity_error = target_velocity - p_cl_state->velocity;
+                float velocity_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
+                // 在转矩和速度控制之间选择较小的值
+                target_iq = (fabsf(target_iq) < fabsf(velocity_iq)) ? target_iq : velocity_iq;
+            }
+            break;
+            
+        case FOC_CONTROL_MODE_TORQUE_POSITION:
+            // 转矩位置控制模式：在转矩控制基础上增加位置限制
+            {
+                float position_error = target_position - p_cl_state->position;
+                float position_velocity = foc_pi_controller_update(&s_closedloop_params.position_pi, position_error, dt);
+                float velocity_error = position_velocity - p_cl_state->velocity;
+                float position_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
+                // 在转矩和位置控制之间选择较小的值
+                target_iq = (fabsf(target_iq) < fabsf(position_iq)) ? target_iq : position_iq;
+            }
+            break;
+            
+        case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
+            // 转矩速度位置控制模式：综合考虑三个控制目标
+            {
+                float position_error = target_position - p_cl_state->position;
+                float position_velocity = foc_pi_controller_update(&s_closedloop_params.position_pi, position_error, dt);
+                float velocity_error = target_velocity - p_cl_state->velocity;
+                float velocity_iq = foc_pi_controller_update(&s_closedloop_params.velocity_pi, velocity_error, dt);
+                // 在三个控制目标之间选择最小的值
+                float min_iq = fabsf(target_iq);
+                if (fabsf(velocity_iq) < min_iq) min_iq = fabsf(velocity_iq);
+                if (fabsf(position_velocity) < min_iq) min_iq = fabsf(position_velocity);
+                target_iq = (target_iq > 0) ? min_iq : -min_iq;
+            }
+            break;
+            
+        default:
+            ESP_LOGW(TAG, "未知的控制模式: %d", s_closedloop_params.control_mode);
+            return ESP_ERR_INVALID_ARG;
     }
 
-    // 电压限幅 - 使用矢量限幅确保不超过电源电压
+    // 电流限幅
+    if (target_iq > s_closedloop_params.current_limit) {
+        target_iq = s_closedloop_params.current_limit;
+    } else if (target_iq < -s_closedloop_params.current_limit) {
+        target_iq = -s_closedloop_params.current_limit;
+    }
+
+    // Step 3: 电流PI控制器计算电压输出 (结果为归一化电压，范围-1到1)
+    float id_error = target_id - p_cl_state->id;
+    float iq_error = target_iq - p_cl_state->iq;
+
+    // 电流闭环控制是最内环，直接影响力矩
+    // 这里d轴控制磁链，通常设为0；q轴控制转矩
+    // 注意：PI控制器输出的是归一化电压（-1到1范围）
+    vd = foc_pi_controller_update(&s_closedloop_params.id_pi, id_error, dt);
+    vq = foc_pi_controller_update(&s_closedloop_params.iq_pi, iq_error, dt);
+
+    // 电压限幅 - 使用矢量限幅确保不超过最大电压
+    // 这里s_closedloop_params.voltage_limit应该为0-1范围
     float v_magnitude = sqrtf(vd * vd + vq * vq);
-    if (v_magnitude > s_closedloop_params.voltage_limit && v_magnitude > 0) {
-        float scale = s_closedloop_params.voltage_limit / v_magnitude;
+    float v_limit = s_closedloop_params.voltage_limit; // 应该为0-1的归一化值
+    
+    if (v_magnitude > v_limit && v_magnitude > 0) {
+        float scale = v_limit / v_magnitude;
         vd *= scale;
         vq *= scale;
     }
@@ -408,25 +489,26 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
     // Step 4: 将d-q轴电压转换到α-β坐标系，再转换到三相电压
     foc_dq_coord_t vdq;
     vdq.d = _IQ(vd);
-    vdq.q = _IQ(vq);
+    vdq.q = _IQ(vq); 
     
     // 如果设置了相序反转，反转q轴电压方向
     if (s_closedloop_params.invert_phase_order) {
         vdq.q = -vdq.q;
+        vdq.d = -vdq.d;
     }
     
     foc_ab_coord_t vab;
     foc_inverse_park_transform(electrical_angle, &vdq, &vab);
     
-    foc_uvw_coord_t vuvw;
-    foc_svpwm_duty_calculate(&vab, &vuvw);
+    foc_uvw_coord_t uvw_out;
+    foc_svpwm_duty_calculate(&vab, &uvw_out);
     
     
-    // 计算PWM占空比
+    // 转换为周期值 (根据inverter接口要求)
     int uvw_duty[3];
-    uvw_duty[0] = _IQtoF(s_closedloop_params.voltage_limit * _IQdiv2(vuvw.u)) * s_closedloop_params.period/4 + (s_closedloop_params.period / 4);
-    uvw_duty[1] = _IQtoF(s_closedloop_params.voltage_limit * _IQdiv2(vuvw.v)) * s_closedloop_params.period/4 + (s_closedloop_params.period / 4);
-    uvw_duty[2] = _IQtoF(s_closedloop_params.voltage_limit * _IQdiv2(vuvw.w)) * s_closedloop_params.period/4 + (s_closedloop_params.period / 4);
+    uvw_duty[0] = (_IQtoF(_IQdiv2(uvw_out.u)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
+    uvw_duty[1] = (_IQtoF(_IQdiv2(uvw_out.v)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
+    uvw_duty[2] = (_IQtoF(_IQdiv2(uvw_out.w)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
     
     // 更新占空比状态
     p_cl_state->duty_u = uvw_duty[0];
@@ -442,49 +524,92 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
 /**
  * @brief 设置控制模式和目标值
  * 
- * @param mode 控制模式(转矩/速度/位置)
- * @param target 目标值(根据模式不同而不同)
+ * @param target 目标值结构体
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_target(foc_control_mode_t mode, float target)
+esp_err_t foc_closedloop_set_target(const foc_target_t *target)
 {
-    if (!s_cl_is_initialized) {
+    if (!s_cl_is_initialized || !p_cl_state) {
         return ESP_ERR_INVALID_STATE;
     }
     
-    // 设置控制模式
-    s_closedloop_params.control_mode = mode;
+    if (!target) {
+        ESP_LOGW(TAG, "目标值为NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
     
-    // 根据控制模式设置目标值
-    switch (mode) {
+    // 记录当前控制模式
+    foc_control_mode_t prev_mode = s_closedloop_params.control_mode;
+    
+    // 更新控制模式
+    s_closedloop_params.control_mode = target->control_mode;
+    
+    // 根据控制模式设置相应的目标值
+    switch (target->control_mode) {
         case FOC_CONTROL_MODE_TORQUE:
-            s_closedloop_params.target_iq = target;
-            ESP_LOGI(TAG, "设置转矩控制模式，目标q轴电流: %.2f A", target);
+            // 转矩控制模式：设置q轴电流目标值
+            s_closedloop_params.target_iq = target->target_current;
             break;
+            
         case FOC_CONTROL_MODE_VELOCITY:
-            s_closedloop_params.target_velocity = target;
-            ESP_LOGI(TAG, "设置速度控制模式，目标速度: %.2f rad/s", target);
+            // 速度控制模式：设置速度目标值
+            s_closedloop_params.target_velocity = target->target_velocity;
             break;
+            
         case FOC_CONTROL_MODE_POSITION:
-            s_closedloop_params.target_position = target;
-            ESP_LOGI(TAG, "设置位置控制模式，目标位置: %.2f rad", target);
+            // 位置控制模式：设置位置目标值
+            s_closedloop_params.target_position = target->target_position;
             break;
+            
         case FOC_CONTROL_MODE_TORQUE_VELOCITY:
-            s_closedloop_params.target_iq = target;
-            ESP_LOGI(TAG, "设置转矩速度控制模式，目标q轴电流: %.2f A", target);
+            // 转矩速度控制模式：设置转矩和速度目标值
+            s_closedloop_params.target_iq = target->target_current;
+            s_closedloop_params.target_velocity = target->target_velocity;
             break;
+            
         case FOC_CONTROL_MODE_TORQUE_POSITION:
-            s_closedloop_params.target_iq = target;
-            ESP_LOGI(TAG, "设置转矩位置控制模式，目标q轴电流: %.2f A", target);
+            // 转矩位置控制模式：设置转矩和位置目标值
+            s_closedloop_params.target_iq = target->target_current;
+            s_closedloop_params.target_position = target->target_position;
             break;
+            
         case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
-            s_closedloop_params.target_iq = target;
-            ESP_LOGI(TAG, "设置转矩速度位置控制模式，目标q轴电流: %.2f A", target);
+            // 转矩速度位置控制模式：设置所有目标值
+            s_closedloop_params.target_iq = target->target_current;
+            s_closedloop_params.target_velocity = target->target_velocity;
+            s_closedloop_params.target_position = target->target_position;
             break;
+            
         default:
-            ESP_LOGW(TAG, "未知的控制模式: %d", mode);
+            ESP_LOGW(TAG, "未知的控制模式: %d", target->control_mode);
             return ESP_ERR_INVALID_ARG;
     }
+    
+    // 如果控制模式发生变化，重置相关控制器的积分项
+    if (prev_mode != target->control_mode) {
+        switch (target->control_mode) {
+            case FOC_CONTROL_MODE_VELOCITY:
+            case FOC_CONTROL_MODE_TORQUE_VELOCITY:
+            case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
+                s_closedloop_params.velocity_pi.integral = 0;
+                break;
+                
+            case FOC_CONTROL_MODE_POSITION:
+            case FOC_CONTROL_MODE_TORQUE_POSITION:
+                s_closedloop_params.position_pi.integral = 0;
+                s_closedloop_params.velocity_pi.integral = 0;
+                break;
+                
+            default:
+                break;
+        }
+        
+        ESP_LOGI(TAG, "控制模式从 %d 切换到 %d", prev_mode, target->control_mode);
+    }
+    
+    // 记录目标值设置
+    ESP_LOGD(TAG, "设置控制目标: 模式=%d, 电流=%.3f A, 速度=%.3f rad/s, 位置=%.3f rad",
+             target->control_mode, target->target_current, target->target_velocity, target->target_position);
     
     return ESP_OK;
 }
