@@ -13,6 +13,7 @@
 
 
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
+#define _2PI        6.28318530718f
 
 static const char *TAG = "foc_control";
 
@@ -32,6 +33,41 @@ static bool s_is_initialized = false;
 
 // 内部函数声明
 static float foc_pi_controller_update(foc_pi_controller_t *pi, float error, float dt);
+
+esp_err_t foc_set_PhaseVoltage(float uq, float ud, float electrical_angle, int period, float voltage_magnitude, foc_duty_t *duty, inverter_handle_t inverter)
+{
+    uq = _constrain(uq, -1.0f, 1.0f);
+    ud = _constrain(ud, -1.0f, 1.0f);
+    // 设置dq电流输出
+    foc_dq_coord_t dq_out;
+    dq_out.d = _IQ(ud);
+    dq_out.q = _IQ(uq);
+    
+    // 执行Park逆变换
+    foc_ab_coord_t ab_out;
+    foc_inverse_park_transform(_IQ(electrical_angle), &dq_out, &ab_out);
+    
+    // 计算SVPWM占空比
+    foc_uvw_coord_t uvw_out;
+    foc_svpwm_duty_calculate(&ab_out, &uvw_out);
+    
+    int _period = period / 2;
+    // 转换为占空比值
+    int uvw_duty[3]; //占空比范围为0-1000
+    // 将IQ数据转换为PWM占空比
+    uvw_duty[0] = (_IQtoF(_IQdiv2(uvw_out.u)) + 0.25f) * _period * voltage_magnitude;
+    uvw_duty[1] = (_IQtoF(_IQdiv2(uvw_out.v)) + 0.25f) * _period * voltage_magnitude;
+    uvw_duty[2] = (_IQtoF(_IQdiv2(uvw_out.w)) + 0.25f) * _period * voltage_magnitude;
+    uvw_duty[0] = _constrain(uvw_duty[0], 0, _period);
+    uvw_duty[1] = _constrain(uvw_duty[1], 0, _period);
+    uvw_duty[2] = _constrain(uvw_duty[2], 0, _period);
+    duty->duty_u = uvw_duty[0];
+    duty->duty_v = uvw_duty[1];
+    duty->duty_w = uvw_duty[2];
+    // 输出PWM
+    svpwm_inverter_set_duty(inverter, uvw_duty[0], uvw_duty[1], uvw_duty[2]);
+    return ESP_OK;
+}
 
 esp_err_t foc_openloop_init(const foc_openloop_params_t *params, foc_openloop_state_t *state)
 {
@@ -183,34 +219,11 @@ float foc_openloop_output(inverter_handle_t inverter)
     
     id = _constrain(id, -current_limit/max_current, current_limit/max_current);
     iq = _constrain(iq, -current_limit/max_current, current_limit/max_current);
-    // 设置dq电流输出
-    foc_dq_coord_t dq_out;
-    dq_out.d = _IQ(id);
-    dq_out.q = _IQ(iq);
-    
-    // 执行Park逆变换
-    foc_ab_coord_t ab_out;
-    foc_inverse_park_transform(_IQ(p_state->angle_elec), &dq_out, &ab_out);
-    
-    // 计算SVPWM占空比
-    foc_uvw_coord_t uvw_out;
-    foc_svpwm_duty_calculate(&ab_out, &uvw_out);
-    
-    // 转换为占空比值
-    int uvw_duty[3]; //占空比范围为0-1000
-    // 将IQ数据转换为PWM占空比
-    uvw_duty[0] = (_IQtoF(_IQdiv2(uvw_out.u)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
-    uvw_duty[1] = (_IQtoF(_IQdiv2(uvw_out.v)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
-    uvw_duty[2] = (_IQtoF(_IQdiv2(uvw_out.w)) + 0.25f) * (s_openloop_params.period / 2) * s_openloop_params.voltage_magnitude;
-    
-    // 保存相电压数据
-    p_state->duty_u = uvw_duty[0];
-    p_state->duty_v = uvw_duty[1];
-    p_state->duty_w = uvw_duty[2];
-    
-    // 输出PWM
-    svpwm_inverter_set_duty(inverter, uvw_duty[0], uvw_duty[1], uvw_duty[2]);
-    
+    foc_duty_t duty;
+    foc_set_PhaseVoltage(iq, id, p_state->angle_elec, s_openloop_params.period, s_openloop_params.voltage_magnitude, &duty, inverter);
+    p_state->duty_u = duty.duty_u;  // 保存占空比
+    p_state->duty_v = duty.duty_v;
+    p_state->duty_w = duty.duty_w;
     // 返回电角度
     return p_state->angle_elec;
 }
@@ -266,13 +279,6 @@ static float foc_pi_controller_update(foc_pi_controller_t *pi, float error, floa
     
     // 计算最终输出
     float output = proportional + integral;
-    
-    // 输出限幅 (确保输出在-1到1范围内，除非设置了其他输出限制)
-    if (output > pi->output_limit) {
-        output = pi->output_limit;
-    } else if (output < -pi->output_limit) {
-        output = -pi->output_limit;
-    }
     
     return output;
 }
@@ -349,14 +355,14 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
         dt = s_closedloop_params.dt;  // 使用默认值
         ESP_LOGW(TAG, "控制周期异常，使用默认值: %.6f s", dt);
     }
-    
-    // 获取电机参数
-    float current_limit = s_closedloop_params.current_limit;
-    float supply_voltage = s_closedloop_params.supply_voltage;
-    float kv = s_closedloop_params.kv;
-    float resistance = s_closedloop_params.resistance;
-    float voltage_limit = s_closedloop_params.voltage_limit;
-    float max_current = supply_voltage/resistance;
+
+    float max_current = s_closedloop_params.supply_voltage/s_closedloop_params.resistance;
+
+    // 计算反电动势常数（Ke）
+    float ke = 9.55f / s_closedloop_params.kv;
+        
+    // 计算反电动势大小
+    float bemf = ke * fabsf(p_cl_state->velocity);
 
     // Step 1: 计算d-q轴电流
     foc_dq_coord_t dq_currents;
@@ -380,14 +386,12 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
     p_cl_state->electrical_angle = _IQtoF(electrical_angle);
     
     // Step 2: 根据控制模式确定目标值
-    float target_id = s_closedloop_params.target_id; // 通常d轴电流目标为0
+    float target_id = 0.0f; // 通常d轴电流目标为0
     float target_iq = s_closedloop_params.target_iq;
-    float target_velocity = s_closedloop_params.target_velocity;
-    float target_position = s_closedloop_params.target_position;
     float vd = 0;
     float vq = 0;
 
-    // 根据控制模式计算目标值
+/*     // 根据控制模式计算目标值
     switch (s_closedloop_params.control_mode) {
         case FOC_CONTROL_MODE_TORQUE:
             // 转矩控制模式：直接使用设定的q轴电流目标值
@@ -452,71 +456,46 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
         default:
             ESP_LOGW(TAG, "未知的控制模式: %d", s_closedloop_params.control_mode);
             return ESP_ERR_INVALID_ARG;
-    }
+    } */
 
-    // 电流限幅
+/*     // 电流限幅
     if (target_iq > s_closedloop_params.current_limit) {
         target_iq = s_closedloop_params.current_limit;
     } else if (target_iq < -s_closedloop_params.current_limit) {
         target_iq = -s_closedloop_params.current_limit;
-    }
+    } */
+
+    float uq = target_iq * s_closedloop_params.resistance / s_closedloop_params.supply_voltage;
+    float ud = target_id * s_closedloop_params.resistance / s_closedloop_params.supply_voltage;
 
     // Step 3: 电流PI控制器计算电压输出 (结果为归一化电压，范围-1到1)
     float id_error = target_id - p_cl_state->id;
     float iq_error = target_iq - p_cl_state->iq;
-
+    float kp = 4.0f;
+    float ki = 50.0f;
     // 电流闭环控制是最内环，直接影响力矩
     // 这里d轴控制磁链，通常设为0；q轴控制转矩
-    // 注意：PI控制器输出的是归一化电压（-1到1范围）
-    vd = foc_pi_controller_update(&s_closedloop_params.id_pi, id_error, dt);
-    vq = foc_pi_controller_update(&s_closedloop_params.iq_pi, iq_error, dt);
+    float id_integral = 0.0f;
+    float iq_integral = 0.0f;
+    id_integral += id_error * dt;
+    iq_integral += iq_error * dt;
+    id_integral = _constrain(id_integral, -1.0f, 1.0f);
+    iq_integral = _constrain(iq_integral, -1.0f, 1.0f);
+    vq = kp * iq_error + ki * iq_integral + target_iq * 0.7f + (bemf / s_closedloop_params.supply_voltage) * 0.2f;
+    vd = kp * id_error + ki * id_integral - (bemf / s_closedloop_params.supply_voltage) * 0.5f;
+    vq = _constrain(vq, -1.0f, 1.0f);
+    vd = _constrain(vd, -1.0f, 1.0f);
 
-    // 电压限幅 - 使用矢量限幅确保不超过最大电压
-    // 这里s_closedloop_params.voltage_limit应该为0-1范围
-    float v_magnitude = sqrtf(vd * vd + vq * vq);
-    float v_limit = s_closedloop_params.voltage_limit; // 应该为0-1的归一化值
-    
-    if (v_magnitude > v_limit && v_magnitude > 0) {
-        float scale = v_limit / v_magnitude;
-        vd *= scale;
-        vq *= scale;
-    }
-    
     // 更新电压输出状态
-    p_cl_state->vd = vd;
-    p_cl_state->vq = vq;
+    p_cl_state->vd = target_iq;
+    p_cl_state->vq = vq; 
     
     // Step 4: 将d-q轴电压转换到α-β坐标系，再转换到三相电压
-    foc_dq_coord_t vdq;
-    vdq.d = _IQ(vd);
-    vdq.q = _IQ(vq); 
-    
-    // 如果设置了相序反转，反转q轴电压方向
-    if (s_closedloop_params.invert_phase_order) {
-        vdq.q = -vdq.q;
-        vdq.d = -vdq.d;
-    }
-    
-    foc_ab_coord_t vab;
-    foc_inverse_park_transform(electrical_angle, &vdq, &vab);
-    
-    foc_uvw_coord_t uvw_out;
-    foc_svpwm_duty_calculate(&vab, &uvw_out);
-    
-    
-    // 转换为周期值 (根据inverter接口要求)
-    int uvw_duty[3];
-    uvw_duty[0] = (_IQtoF(_IQdiv2(uvw_out.u)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
-    uvw_duty[1] = (_IQtoF(_IQdiv2(uvw_out.v)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
-    uvw_duty[2] = (_IQtoF(_IQdiv2(uvw_out.w)) + 0.25f) * (s_closedloop_params.period / 4) * s_closedloop_params.voltage_limit;
-    
-    // 更新占空比状态
-    p_cl_state->duty_u = uvw_duty[0];
-    p_cl_state->duty_v = uvw_duty[1];
-    p_cl_state->duty_w = uvw_duty[2];
-    
-    // 输出PWM
-    svpwm_inverter_set_duty(inverter, uvw_duty[0], uvw_duty[1], uvw_duty[2]);
+    foc_duty_t duty;
+    foc_set_PhaseVoltage(vq, vd, p_cl_state->electrical_angle, s_closedloop_params.period, s_closedloop_params.voltage_limit, &duty, inverter);
+    p_cl_state->duty_u = duty.duty_u;
+    p_cl_state->duty_v = duty.duty_v;
+    p_cl_state->duty_w = duty.duty_w;
     
     return ESP_OK;
 }

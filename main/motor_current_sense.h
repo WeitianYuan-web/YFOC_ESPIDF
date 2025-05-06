@@ -19,7 +19,7 @@ extern "C" {
 #define CURRENT_SENSE_GAIN              50.0f  // 50倍放大倍数
 
 // ADC连续转换配置常量
-#define CURRENT_SENSE_SAMPLE_FREQ       40000  // 采样频率 40KHz
+#define CURRENT_SENSE_SAMPLE_FREQ       80000  // 采样频率 80KHz
 #define CURRENT_SENSE_FRAME_SIZE        512    // 单次转换帧大小(字节)
 #define CURRENT_SENSE_MAX_BUFFER_SIZE   4096   // 最大缓冲区大小(字节)
 
@@ -101,6 +101,9 @@ esp_err_t current_sense_deinit(void);
  */
 typedef void (*current_sense_callback_t)(const current_sense_reading_t *reading, void *user_data);
 esp_err_t current_sense_register_callback(current_sense_callback_t callback, void *user_data);
+
+// 添加新的直接采样函数声明
+esp_err_t current_sense_sample(current_sense_reading_t *reading);
 
 #ifdef __cplusplus
 }

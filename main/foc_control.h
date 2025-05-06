@@ -26,6 +26,7 @@ typedef struct {
     int pole_pairs;              // 电机极对数
     int period;                  // 周期
     int direction;               // 电机方向
+    float zero_angle_rad;        // 机械零角度(rad)
 } foc_openloop_params_t;
 
 /**
@@ -80,6 +81,7 @@ typedef struct {
     float resistance;            // 电机相电阻(欧姆)
     float voltage_limit;         // 电压限制(0.0-1.0)
     float dt;                    // 控制周期(秒)
+    float zero_angle_rad;        // 机械零角度(rad)
     
     // 控制模式
     foc_control_mode_t control_mode;
@@ -117,9 +119,9 @@ typedef struct {
     // 控制输出
     float vd;                    // d轴电压控制输出
     float vq;                    // q轴电压控制输出
-    float duty_u;                // U相占空比
-    float duty_v;                // V相占空比
-    float duty_w;                // W相占空比
+    int duty_u;
+    int duty_v;
+    int duty_w;
     
     uint64_t timestamp_us;       // 上次更新时间戳(us)
 } foc_closedloop_state_t;
@@ -134,6 +136,21 @@ typedef struct {
     float target_position;            ///< 目标位置(rad)
 } foc_target_t;
 
+typedef struct {
+    int duty_u;
+    int duty_v;
+    int duty_w;
+} foc_duty_t;
+
+/**
+ * @brief 设置相电压
+ * 
+ * @param uq q轴电压(比0-1)
+ * @param ud d轴电压(比0-1)
+ * @param electrical_angle 电气角度(rad)
+ * @param inverter SVPWM逆变器句柄
+ */
+esp_err_t foc_set_PhaseVoltage(float uq, float ud, float electrical_angle, int period, float voltage_magnitude, foc_duty_t *duty, inverter_handle_t inverter);
 /**
  * @brief 初始化FOC开环控制
  * 

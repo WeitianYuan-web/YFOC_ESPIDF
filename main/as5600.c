@@ -186,10 +186,7 @@ void as5600_set_dt(float dt_sec) {
     g_as5600.dt_iq = _IQ(dt_sec);
 }
 
-// 设置零点角度
-void as5600_set_zero_angle(float zero_angle_rad) {
-    // 未使用零点角度，保留此接口以兼容旧代码
-}
+
 
 // 获取原始角度值
 uint16_t as5600_get_raw_angle(void) {
@@ -310,27 +307,21 @@ float as5600_get_angle(void) {
 }
 
 // 获取电角度 (浮点格式，兼容原接口)
-float as5600_get_electrical_angle(int pole_pairs) {
-    float elec_angle = g_as5600.rotor_phy_angle * pole_pairs;
-    
+float as5600_get_electrical_angle(int pole_pairs , int direction, float zero_angle_rad) {
+    float elec_angle = g_as5600.rotor_phy_angle * pole_pairs * direction - zero_angle_rad;//减去零点角度
     // 确保角度在[0, 2π)范围内
-    while (elec_angle >= 6.28318530718f) {
-        elec_angle -= 6.28318530718f;
-    }
-    while (elec_angle < 0) {
-        elec_angle += 6.28318530718f;
-    }
-    
-    return elec_angle;
+    elec_angle = fmod(elec_angle, _2PI);
+    return elec_angle >= 0 ? elec_angle : (elec_angle + _2PI);
 }
 
 // 获取电角度 (IQ格式) - 新接口
-_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction) {
+_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction, float zero_angle_rad) {
     _iq pole_pairs_iq = _IQ(pole_pairs);
     _iq direction_iq = _IQ(direction);
     _iq elec_angle_iq = _IQmpy(g_as5600.rotor_phy_angle_iq, pole_pairs_iq);
     elec_angle_iq = _IQmpy(elec_angle_iq, direction_iq);
-    
+    elec_angle_iq = elec_angle_iq - _IQ(zero_angle_rad);
+
     // 确保角度在[0, 2π)范围内
     while (_IQtoF(elec_angle_iq) >= _IQtoF(_2PI_IQ)) {
         elec_angle_iq = elec_angle_iq - _2PI_IQ;

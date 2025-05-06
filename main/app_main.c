@@ -18,8 +18,12 @@
 #include "uart_command.h"
 #include "motor_config.h"  // 添加电机配置头文件
 
+#define _2PI        6.28318530718f
+#define _PI         3.14159265359f
+#define _2PI_7      0.89759790102f
+#define _3PI_2      4.71238898038f
 // 选择FOC控制模式：FOC_CONTROL_OPENLOOP为开环控制，FOC_CONTROL_CLOSEDLOOP为闭环控制
-#define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_OPENLOOP
+#define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_CLOSEDLOOP
 #define FOC_CONTROL_MODE_DEBUG     1
 // 控制模式定义
 #define FOC_CONTROL_OPENLOOP       0
@@ -31,8 +35,8 @@ static const char *TAG = "example_foc";
 ////////////// Please update the following configuration according to your HardWare spec /////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 #define EXAMPLE_FOC_DRV_EN_GPIO          12
-#define EXAMPLE_FOC_PWM_U_GPIO           32
-#define EXAMPLE_FOC_PWM_V_GPIO           33
+#define EXAMPLE_FOC_PWM_U_GPIO           33
+#define EXAMPLE_FOC_PWM_V_GPIO           32
 #define EXAMPLE_FOC_PWM_W_GPIO           25
 
 // UART配置
@@ -45,8 +49,8 @@ static const char *TAG = "example_foc";
 #define EXAMPLE_FOC_MCPWM_PERIOD              2000     // 2000 * 0.05us = 100us, 10KHz
 
 // 电流采样引脚配置
-#define CURRENT_SENSE_U_PIN 39  
-#define CURRENT_SENSE_V_PIN 36  
+#define CURRENT_SENSE_U_PIN 36  
+#define CURRENT_SENSE_V_PIN 39  
 
 // 获取当前电机配置
 static const motor_config_t* motor_config;
@@ -137,6 +141,7 @@ typedef struct {
     float voltage;
     float encoder_angle;     // 编码器角度(弧度)
     float encoder_speed;     // 编码器速度(RPM)
+    float encoder_electrical_angle;     // 编码器电角度(弧度)
     int32_t total_angle_raw; // 总角度原始值
     int32_t full_rotations;  // 完整旋转圈数
     float current_u;         // U相电流(安培)
@@ -167,7 +172,7 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
             // 如果是闭环模式，设置速度目标
             foc_target_t target = {
                 .control_mode = FOC_CONTROL_MODE_TORQUE,
-                .target_current = value / 1000.0f
+                .target_current = value / 100.0f
             };
             foc_closedloop_set_target(&target);
             ESP_LOGI(TAG, "设置闭环电流为: %.2f A", target.target_current);
@@ -241,7 +246,7 @@ static void uart_communication_task(void* arg)
             uart_buffer[4] = data.speed_rpm;
             uart_buffer[5] = data.voltage;
             uart_buffer[6] = data.encoder_angle;
-            uart_buffer[7] = data.encoder_speed;
+            uart_buffer[7] = data.encoder_electrical_angle;
             uart_buffer[8] = data.total_angle_raw;
             uart_buffer[9] = data.full_rotations;
             uart_buffer[10] = data.current_u;
@@ -305,7 +310,7 @@ static void foc_control_task(void* arg)
                     .u_phase_channel = u_channel,
                     .v_phase_unit = v_unit,
                     .v_phase_channel = v_channel,
-                    .sample_freq_hz = 40000,          // 40kHz采样频率
+                    .sample_freq_hz = 80000,          // 80kHz采样频率
                     .zero_current_adc_u = 2048.0f,    // 默认零点值
                     .zero_current_adc_v = 2048.0f,    // 默认零点值
                     .use_w_calculation = true         // 通过计算得到W相电流
@@ -358,29 +363,32 @@ static void foc_control_task(void* arg)
         .pole_pairs = EXAMPLE_MOTOR_POLE_PAIRS,
         .direction = EXAMPLE_MOTOR_DIRECTION,
         .period = EXAMPLE_FOC_MCPWM_PERIOD,
+        .supply_voltage = EXAMPLE_MOTOR_SUPPLY_VOLTAGE,
+        .kv = EXAMPLE_MOTOR_KV,
+        .resistance = EXAMPLE_MOTOR_RESISTANCE,
         .current_limit = EXAMPLE_MOTOR_CURRENT_LIMIT,          
         .voltage_limit = EXAMPLE_MOTOR_MAX_VOLTAGE,
         .dt = 1.0f / FOC_CONTROL_FREQ_HZ, // 控制周期
-        
+        .zero_angle_rad = 0.598f,
         // 使用速度控制模式 - 与下方set_target保持一致
         .control_mode = FOC_CONTROL_MODE_VELOCITY,
         
-        .invert_phase_order = true,
+        .invert_phase_order = false,
         
         .target_iq = 0.0f,              // 初始q轴电流为0
         .target_id = 0.0f,              // d轴电流目标为0
         
-        .current_filter_alpha = 0.01f,   // 较小的值滤波效果更强
+        .current_filter_alpha = 0.005f,   // 较小的值滤波效果更强
         
         // 初始化电流PI控制器
         .id_pi = {
-            .kp = 0.8f,     // 为d轴添加控制，保持在0电流
+            .kp = 1.0f,     // 为d轴添加控制，保持在0电流
             .ki = 0.0f,     // 适当的积分系数
             .output_limit = 1.0f,
             .integral = 0.0f
         },
         .iq_pi = {
-            .kp = 0.8f,
+            .kp = 2.0,
             .ki = 0.0f,    // 增加积分系数提高响应性
             .output_limit = 1.0f,
             .integral = 0.0f
@@ -409,11 +417,20 @@ static void foc_control_task(void* arg)
         ESP_LOGI(TAG, "FOC闭环控制初始化完成");
     }
     
+    ESP_LOGI(TAG, "设置零电角度");
+    foc_duty_t duty;
+    foc_set_PhaseVoltage(0.5f, 0.0f, _3PI_2, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    as5600_update();
+    closedloop_params.zero_angle_rad = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, 0.0f);
+
+    ESP_LOGI(TAG, "设置零电角度: %.2f rad", closedloop_params.zero_angle_rad);
+    foc_set_PhaseVoltage(0.0f, 0.0f, 0.0f, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter); 
+    vTaskDelay(pdMS_TO_TICKS(100));
     // 设置速度目标为10 rad/s
     foc_target_t target = {
-        .control_mode = FOC_CONTROL_MODE_VELOCITY,
-        .target_velocity = 400.0f,
-        .target_current = 0.5f
+        .control_mode = FOC_CONTROL_MODE_TORQUE,
+        .target_current = 0.2f
     };
     foc_closedloop_set_target(&target);
     ESP_LOGI(TAG, "设置电流: %.2f A，开始闭环控制", target.target_current);
@@ -421,7 +438,7 @@ static void foc_control_task(void* arg)
 
     // 主循环变量声明 - 放在这里避免循环中重复声明
     float angle_elec = 0;
-    _iq electrical_angle_iq = _IQ(0);
+    float electrical_angle = 0;
     foc_uvw_coord_t phase_currents = {.u = _IQ(0), .v = _IQ(0), .w = _IQ(0)};
     foc_dq_coord_t dq_currents = {.d = _IQ(0), .q = _IQ(0)};
     float velocity = 0;
@@ -439,12 +456,13 @@ static void foc_control_task(void* arg)
             // 更新编码器
             as5600_set_dt(dt / 1000000.0f);
             as5600_update();
-            electrical_angle_iq = as5600_get_electrical_angle_iq(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION);
+            electrical_angle = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, closedloop_params.zero_angle_rad);
             
             // 读取电流数据
             if (g_current_sense_initialized) {
-                esp_err_t ret = current_sense_read(&g_current_reading, 10);
-                if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) {
+                // 直接采样获取电流，而不是读取其他任务更新的数据
+                esp_err_t ret = current_sense_sample(&g_current_reading);
+                if (ret != ESP_OK) {
                     ESP_LOGW(TAG, "读取电流值失败: %d", ret);
                 }
             }
@@ -461,15 +479,20 @@ static void foc_control_task(void* arg)
             angle_elec = foc_openloop_output(inverter);
             
     #if FOC_CONTROL_MODE_DEBUG == 1
+            foc_dq_coord_t dq_currents_r = {.d = _IQ(0), .q = _IQ(0)};
             // Debug模式下，计算dq电流
             foc_calculate_dq_current(&phase_currents, _IQ(angle_elec), &dq_currents);
+            foc_calculate_dq_current(&phase_currents, _IQ(electrical_angle), &dq_currents_r);
     #endif
 #else
             // 闭环控制
             velocity = as5600_get_speed_rad();
             position = as5600_get_position();
             foc_closedloop_set_motion_state(velocity, position);
-            foc_closedloop_output(inverter, &phase_currents, electrical_angle_iq);
+            foc_closedloop_output(inverter, &phase_currents, _IQ(electrical_angle));
+
+
+            foc_calculate_dq_current(&phase_currents, _IQ(electrical_angle), &dq_currents);
 #endif
             
 #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
@@ -497,10 +520,10 @@ static void foc_control_task(void* arg)
                     .speed_rpm = params->speed_rpm,
                     .voltage = params->voltage_magnitude,
 #if FOC_CONTROL_MODE_DEBUG == 1
-                    .test_data = _IQtoF(electrical_angle_iq),
+                    .test_data = _IQtoF(electrical_angle),
                     .test_data2 = ol_state->angle_elec,
-                    .d_current = - _IQtoF(dq_currents.d), 
-                    .q_current = - _IQtoF(dq_currents.q),
+                    .d_current = - _IQtoF(dq_currents_r.d), 
+                    .q_current = - _IQtoF(dq_currents_r.q),
 #endif
 #else
                     .duty_u = cl_state->duty_u,
@@ -517,8 +540,9 @@ static void foc_control_task(void* arg)
                     .current_u = g_current_reading.current_u,
                     .current_v = g_current_reading.current_v,
                     .current_w = g_current_reading.current_w,
-/*                     .test_data = params->target_id,
-                    .test_data2 = params->target_iq */
+                    .encoder_electrical_angle = electrical_angle,
+                    .test_data = cl_state->vd,
+                    .test_data2 = cl_state->vq,
                 };
                 
                 // 发送数据到队列，不等待(非阻塞)

@@ -95,7 +95,7 @@ float as5600_get_angle(void);
  * @param pole_pairs 电机极对数
  * @return float 电角度(弧度)
  */
-float as5600_get_electrical_angle(int pole_pairs);
+float as5600_get_electrical_angle(int pole_pairs, int direction, float zero_angle_rad);
 
 /**
  * @brief 获取电角度(IQ格式)
@@ -103,7 +103,7 @@ float as5600_get_electrical_angle(int pole_pairs);
  * @param pole_pairs 电机极对数
  * @return _iq 电角度(弧度，IQ格式)
  */
-_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction);
+_iq as5600_get_electrical_angle_iq(int pole_pairs, int direction, float zero_angle_rad);
 
 /**
  * @brief 获取转速
