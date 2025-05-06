@@ -144,6 +144,7 @@ typedef struct {
     float encoder_speed;     // 编码器速度(RPM)
     float encoder_electrical_angle;     // 编码器电角度(弧度)
     int32_t total_angle_raw; // 总角度原始值
+    float total_angle_rad;   // 总角度(弧度)
     int32_t full_rotations;  // 完整旋转圈数
     float current_u;         // U相电流(安培)
     float current_v;         // V相电流(安培)
@@ -163,11 +164,11 @@ static QueueHandle_t uart_queue = NULL;
 
 // 目标值
 foc_target_t target = {
-        .control_mode = FOC_CONTROL_MODE_TORQUE,
+        .control_mode = FOC_CONTROL_MODE_POSITION_RAW,
         .target_current = 0.2f,
         .target_maxcurrent = 0.5f,
         .target_velocity = 30.0f,
-        .target_position = 0.0f
+        .target_position = 3.0f
  };
 
 // 定义UART命令回调函数
@@ -194,7 +195,7 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 target.target_velocity = value / 10.0f;
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环速度为: %.2f RPM", target.target_velocity);
-            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION)
+            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL || target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
             {
                 target.target_position = value / 100.0f;
                 target.target_position = fmod(target.target_position, _2PI);
@@ -218,7 +219,7 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
             }
-            else if(target.control_mode == FOC_CONTROL_MODE_POSITION)
+            else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL || target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
             {
                 target.target_maxcurrent = value / 100.0f;
                 foc_closedloop_set_target(&target);
@@ -290,7 +291,7 @@ static void uart_communication_task(void* arg)
             uart_buffer[5] = data.speed_rad;
             uart_buffer[6] = data.encoder_angle;
             uart_buffer[7] = data.encoder_electrical_angle;
-            uart_buffer[8] = data.total_angle_raw;
+            uart_buffer[8] = data.total_angle_rad;
             uart_buffer[9] = data.full_rotations;
             uart_buffer[10] = data.current_u;
             uart_buffer[11] = data.current_v;
@@ -445,17 +446,31 @@ static void foc_control_task(void* arg)
 
         // 速度和位置控制器参数
         .velocity_pid = {
-            .kp = 0.023f,    // 比例系数
-            .ki = 0.006f,     // 积分系数
-            .kd = 0.0001f,     // 微分控制
+            .kp = 0.0125f,    // 比例系数
+            .ki = 0.015f,     // 积分系数
+            .kd = 0.00002f,     // 微分控制
             .output_limit = 0.5f,//速度PID积分限幅
             .integral = 0.0f
         },
+        .position_signal_pid = {
+            .kp = 0.5f,
+            .ki = 0.001f,
+            .kd = 0.00001f,     // 不使用微分控制
+            .output_limit = 0.5f,//位置PID积分限幅
+            .integral = 0.0f
+        },
+        .position_raw_pid = {
+            .kp = 0.5f,
+            .ki = 0.001f,
+            .kd = 0.00001f,     // 不使用微分控制
+            .output_limit = 0.5f,//位置PID积分限幅
+            .integral = 0.0f
+        },
         .position_pid = {
-            .kp = 1.0f,
-            .ki = 0.1f,
-            .kd = 0.0f,     // 不使用微分控制
-            .output_limit = 100.0f,//位置PID积分限幅
+            .kp = 0.5f,
+            .ki = 0.001f,
+            .kd = 0.00001f,     // 不使用微分控制
+            .output_limit = 0.5f,//位置PID积分限幅
             .integral = 0.0f
         }
     };
@@ -490,7 +505,8 @@ static void foc_control_task(void* arg)
     foc_uvw_coord_t phase_currents = {.u = _IQ(0), .v = _IQ(0), .w = _IQ(0)};
     foc_dq_coord_t dq_currents = {.d = _IQ(0), .q = _IQ(0)};
     float velocity = 0;
-    float position = 0;
+    float position_signal = 0;
+    float position_rad = 0;
 
     while (true) {
         // 等待定时器触发
@@ -535,8 +551,9 @@ static void foc_control_task(void* arg)
 #else
             // 闭环控制
             velocity = as5600_get_speed_rad();
-            position = as5600_get_position();
-            foc_closedloop_set_motion_state(velocity, position);
+            position_signal = as5600_get_position();
+            position_rad = as5600_get_total_angle_rad();
+            foc_closedloop_set_motion_state(velocity, position_signal, position_rad);
             foc_closedloop_output(inverter, &phase_currents, _IQ(electrical_angle));
 
 
@@ -589,6 +606,7 @@ static void foc_control_task(void* arg)
                     .encoder_angle = as5600_get_position(),
                     .encoder_speed = as5600_get_speed_rpm(),
                     .total_angle_raw = as5600_get_total_angle_raw(),
+                    .total_angle_rad = as5600_get_total_angle_rad(),
                     .full_rotations = as5600_get_full_rotations(),
                     .current_u = g_current_reading.current_u,
                     .current_v = g_current_reading.current_v,

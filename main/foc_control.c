@@ -34,6 +34,31 @@ static bool s_is_initialized = false;
 // 内部函数声明
 static float foc_pid_controller_update(foc_pid_controller_t *pid, float error, float dt);
 
+/**
+ * @brief 计算两个角度之间的差值，并确保结果在-180度到180度之间
+ * 
+ * @param diff 两个角度之间的差值
+ * @param cycle 角度周期（通常为360度）
+ * @return float 调整后的角度差值
+ */
+float cycle_diff(float diff, float cycle)
+{
+    // 参数校验
+    const float eps = 1e-6f;
+    if (cycle <= 0.0f || isnan(cycle)) {
+        return NAN;  // 或返回原值/抛出错误
+    }
+
+    // 计算半周期并调整
+    const float half_cycle = cycle / 2.0f;
+    if (diff > half_cycle + eps) {
+        diff -= cycle;
+    } else if (diff < -half_cycle - eps) {
+        diff += cycle;
+    }
+    return diff;
+}
+
 esp_err_t foc_set_PhaseVoltage(float uq, float ud, float electrical_angle, int period, float voltage_magnitude, foc_duty_t *duty, inverter_handle_t inverter)
 {
     uq = _constrain(uq, -1.0f, 1.0f);
@@ -399,18 +424,40 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
             {   
                 target_velocity = s_closedloop_params.target_velocity;
                 float velocity_error = target_velocity - p_cl_state->velocity;
-                target_iq = foc_pid_controller_update(&s_closedloop_params.velocity_pid, velocity_error, dt);
+                float vel_derivative = (velocity_error - s_closedloop_params.velocity_pid.last_error) / dt;
+                s_closedloop_params.velocity_pid.last_error = velocity_error;
+                
+                float p_vel = s_closedloop_params.velocity_pid.kp * velocity_error;
+                float d_vel = s_closedloop_params.velocity_pid.kd * vel_derivative;
+                float pd_vel = p_vel + d_vel;
+                
+             if (fabs(pd_vel) < 1.0f) {
+                    s_closedloop_params.velocity_pid.integral += velocity_error * dt;
+                    s_closedloop_params.velocity_pid.integral = _constrain(s_closedloop_params.velocity_pid.integral, -s_closedloop_params.velocity_pid.output_limit, s_closedloop_params.velocity_pid.output_limit);
+                } else {
+
+                    s_closedloop_params.velocity_pid.integral *= 0.98f;
+                }
+                target_iq = pd_vel + s_closedloop_params.velocity_pid.integral;
             }
             break;
             
-        case FOC_CONTROL_MODE_POSITION:
+        case FOC_CONTROL_MODE_POSITION_SIGNAL:
             // 位置控制模式：通过位置PI控制器计算速度目标，再通过速度PI控制器计算q轴电流目标
             {   
                 target_position = s_closedloop_params.target_position;
-                float position_error = target_position - p_cl_state->position;
-                target_velocity = foc_pid_controller_update(&s_closedloop_params.position_pid, position_error, dt);
-                float velocity_error = target_velocity - p_cl_state->velocity;
-                target_iq = foc_pid_controller_update(&s_closedloop_params.velocity_pid, velocity_error, dt);
+                float position_error = target_position - p_cl_state->position_signal;
+                position_error = cycle_diff(position_error, _2PI);
+                target_iq = foc_pid_controller_update(&s_closedloop_params.position_signal_pid, position_error, dt);
+            }
+            break;
+            
+        case FOC_CONTROL_MODE_POSITION_RAW:
+            {
+                // 位置控制模式：直接使用设定的位置目标值
+                target_position = s_closedloop_params.target_position;
+                float position_error = target_position - p_cl_state->position_rad;
+                target_iq = foc_pid_controller_update(&s_closedloop_params.position_raw_pid, position_error, dt);
             }
             break;
             
@@ -419,7 +466,7 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
             {   
                 target_position = s_closedloop_params.target_position;
                 target_velocity = s_closedloop_params.target_velocity;
-                float position_error = target_position - p_cl_state->position;
+                float position_error = target_position - p_cl_state->position_signal;
                 float position_velocity = foc_pid_controller_update(&s_closedloop_params.position_pid, position_error, dt);
                 float velocity_error = target_velocity - p_cl_state->velocity;
                 float velocity_iq = foc_pid_controller_update(&s_closedloop_params.velocity_pid, velocity_error, dt);
@@ -524,12 +571,16 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
             s_closedloop_params.target_maxcurrent = target_maxcurrent;
             break;
             
-        case FOC_CONTROL_MODE_POSITION:
+        case FOC_CONTROL_MODE_POSITION_SIGNAL:
             // 位置控制模式：设置位置目标值
             s_closedloop_params.target_position = target->target_position;
             s_closedloop_params.target_maxcurrent = target_maxcurrent;
             break;
-            
+        case FOC_CONTROL_MODE_POSITION_RAW:
+            // 位置控制模式：设置位置目标值
+            s_closedloop_params.target_position = target->target_position;
+            s_closedloop_params.target_maxcurrent = target_maxcurrent;
+            break;
         case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
             // 转矩速度位置控制模式：设置所有目标值
             s_closedloop_params.target_velocity = target->target_velocity;
@@ -546,11 +597,18 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
     if (prev_mode != target->control_mode) {
         switch (target->control_mode) {
             case FOC_CONTROL_MODE_VELOCITY:
-            case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
                 s_closedloop_params.velocity_pid.integral = 0;
                 break;
-                
-            case FOC_CONTROL_MODE_POSITION:
+            case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
+                s_closedloop_params.velocity_pid.integral = 0;
+                s_closedloop_params.position_pid.integral = 0;
+                break;
+            case FOC_CONTROL_MODE_POSITION_SIGNAL:
+                s_closedloop_params.position_pid.integral = 0;
+                break;
+            case FOC_CONTROL_MODE_POSITION_RAW:
+                s_closedloop_params.position_pid.integral = 0;
+                break;
             default:
                 break;
         }
@@ -569,17 +627,19 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
  * @brief 设置速度和位置
  * 
  * @param velocity 当前速度(rad/s)
- * @param position 当前位置(rad)
+ * @param position_signal 当前位置(rad)
+ * @param position_raw 多圈位置
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_motion_state(float velocity, float position)
+esp_err_t foc_closedloop_set_motion_state(float velocity, float position_signal, float position_rad)
 {
     if (!s_cl_is_initialized || !p_cl_state) {
         return ESP_ERR_INVALID_STATE;
     }
     
     p_cl_state->velocity = velocity;
-    p_cl_state->position = position;
+    p_cl_state->position_signal = position_signal;
+    p_cl_state->position_rad = position_rad;
     
     return ESP_OK;
 }
@@ -625,15 +685,19 @@ esp_err_t foc_closedloop_stop(void)
             // 对于速度控制，设置目标速度为0
             s_closedloop_params.target_velocity = 0;
             break;
-        case FOC_CONTROL_MODE_POSITION:
+        case FOC_CONTROL_MODE_POSITION_SIGNAL:
             // 对于位置控制，保持当前位置
-            s_closedloop_params.target_position = p_cl_state->position;
+            s_closedloop_params.target_position = p_cl_state->position_signal;
+            break;
+        case FOC_CONTROL_MODE_POSITION_RAW:
+            // 对于位置控制，保持当前位置
+            s_closedloop_params.target_position = p_cl_state->position_rad;
             break;
         case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
             // 对于转矩速度位置控制，保持当前状态
             s_closedloop_params.target_iq = p_cl_state->iq;
             s_closedloop_params.target_velocity = p_cl_state->velocity;
-            s_closedloop_params.target_position = p_cl_state->position;
+            s_closedloop_params.target_position = p_cl_state->position_rad;
             break;
     }
     

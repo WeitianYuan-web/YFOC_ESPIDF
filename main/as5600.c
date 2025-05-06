@@ -246,7 +246,8 @@ esp_err_t as5600_update(void) {
     
     // 计算总角度（原始值）
     g_as5600.total_angle_raw = g_as5600.full_rotations * 4096 + raw_angle;
-    
+    // 计算总角度（弧度）
+    g_as5600.total_angle_rad = g_as5600.full_rotations * 2 * M_PI + raw_angle * _SCALE;
     // 使用IQMath计算物理角度 (弧度) - 优化计算
     _iq raw_angle_iq = _IQ(raw_angle);
     g_as5600.rotor_phy_angle_iq = _IQmpy(raw_angle_iq, _SCALE_IQ);
@@ -348,6 +349,10 @@ int32_t as5600_get_total_angle_raw(void) {
     return g_as5600.total_angle_raw;
 }
 
+// 获取总角度(弧度)
+float as5600_get_total_angle_rad(void) {
+    return g_as5600.total_angle_rad;
+}
 // 获取完整旋转圈数
 int32_t as5600_get_full_rotations(void) {
     return g_as5600.full_rotations;

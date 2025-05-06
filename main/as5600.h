@@ -20,7 +20,7 @@
 #define AS5600_MAGNITUDE_REG 0x1B   // 磁场强度寄存器
 
 #define AS5600_MAX_RAW_ANGLE 4095   // 12位编码器的最大原始值
-
+#define _SCALE         0.0015339808f//2π/4096
 // IQMath常量定义
 #define _2PI_IQ        _IQ(6.28318530718)
 #define _60_IQ         _IQ(60.0)
@@ -33,6 +33,7 @@ typedef struct {
     uint16_t angle_prev;            // 上一次的角度值
     int32_t full_rotations;         // 完整旋转圈数
     int32_t total_angle_raw;        // 总角度原始值
+    float total_angle_rad;          // 总角度(弧度)
     float rotor_phy_angle;          // 物理角度(弧度) - 范围0-2π (保留浮点供外部接口使用)
     float position_rad;             // 位置(弧度) - 多圈可能很大 (保留浮点供外部接口使用)
     _iq rotor_phy_angle_iq;        // 物理角度(弧度) - IQ格式
@@ -125,6 +126,13 @@ float as5600_get_speed_rpm(void);
  * @return int32_t 总角度原始值
  */
 int32_t as5600_get_total_angle_raw(void);
+
+/**
+ * @brief 获取总角度(弧度)
+ * 
+ * @return float 总角度(弧度)
+ */
+float as5600_get_total_angle_rad(void);
 
 /**
  * @brief 获取完整旋转圈数
