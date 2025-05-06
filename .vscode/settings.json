@@ -16,6 +16,8 @@
         "esp_err.h": "c",
         "adc_continuous.h": "c",
         "esp_foc.h": "c",
-        "esp_timer.h": "c"
+        "esp_timer.h": "c",
+        "as5600.h": "c",
+        "freertos.h": "c"
     }
 }

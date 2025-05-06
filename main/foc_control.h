@@ -52,9 +52,11 @@ typedef struct {
 typedef struct {
     float kp;               // 比例增益
     float ki;               // 积分增益
+    float kd;               // 微分增益
     float integral;         // 积分项累积值
+    float last_error;       // 上一次误差
     float output_limit;     // 输出限制，防止积分饱和
-} foc_pi_controller_t;
+} foc_pid_controller_t;
 
 /**
  * @brief FOC闭环控制模式
@@ -63,9 +65,7 @@ typedef enum {
     FOC_CONTROL_MODE_TORQUE = 0,  // 转矩控制模式
     FOC_CONTROL_MODE_VELOCITY = 1,    // 速度控制模式
     FOC_CONTROL_MODE_POSITION = 2,     // 位置控制模式
-    FOC_CONTROL_MODE_TORQUE_VELOCITY = 3, // 转矩速度控制模式
-    FOC_CONTROL_MODE_TORQUE_POSITION = 4, // 转矩位置控制模式
-    FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION = 5 // 转矩速度位置控制模式
+    FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION = 3 // 转矩速度位置控制模式
 } foc_control_mode_t;
 
 /**
@@ -92,6 +92,7 @@ typedef struct {
     // 目标值
     float target_iq;             // 目标q轴电流(转矩电流)
     float target_id;             // 目标d轴电流(通常为0)
+    float target_maxcurrent;     // 目标最大电流(A)
     float target_velocity;       // 目标速度(rad/s)
     float target_position;       // 目标位置(rad)
     
@@ -99,10 +100,10 @@ typedef struct {
     float current_filter_alpha;  // 电流低通滤波系数 (0.0-1.0)
     
     // PI控制器参数
-    foc_pi_controller_t id_pi;   // d轴电流控制器
-    foc_pi_controller_t iq_pi;   // q轴电流控制器
-    foc_pi_controller_t velocity_pi; // 速度控制器
-    foc_pi_controller_t position_pi; // 位置控制器
+    foc_pid_controller_t id_pid;   // d轴电流控制器
+    foc_pid_controller_t iq_pid;   // q轴电流控制器
+    foc_pid_controller_t velocity_pid; // 速度控制器
+    foc_pid_controller_t position_pid; // 位置控制器
 } foc_closedloop_params_t;
 
 /**
@@ -132,6 +133,7 @@ typedef struct {
 typedef struct {
     foc_control_mode_t control_mode;  ///< 控制模式
     float target_current;              ///< 目标电流(A)
+    float target_maxcurrent;          ///< 目标最大电流(A)
     float target_velocity;            ///< 目标速度(rad/s)
     float target_position;            ///< 目标位置(rad)
 } foc_target_t;

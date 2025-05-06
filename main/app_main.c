@@ -100,7 +100,7 @@ uint32_t dt = 0;
 // Debug模式配置
 #define FOC_TASK_STACK_SIZE     8192
 #define FOC_TASK_PRIORITY       5
-#define FOC_CONTROL_FREQ_HZ     2500  // 2.5kHz控制频率
+#define FOC_CONTROL_FREQ_HZ     2000  // 2kHz控制频率
 #define FOC_TASK_CORE_ID        1
 #else
 // 非Debug模式配置
@@ -138,6 +138,7 @@ typedef struct {
     float duty_v;
     float duty_w;
     float speed_rpm;
+    float speed_rad;
     float voltage;
     float encoder_angle;     // 编码器角度(弧度)
     float encoder_speed;     // 编码器速度(RPM)
@@ -149,12 +150,25 @@ typedef struct {
     float current_w;         // W相电流(安培)
     float d_current;         // d轴电流(安培)
     float q_current;         // q轴电流(安培)
+    float target_current;    // 目标电流(安培)
+    float target_velocity;   // 目标速度(RPM)
+    float target_position;   // 目标位置(弧度)
+    float target_maxcurrent; // 目标最大电流(安培)
     float test_data;         // 测试数据
     float test_data2;        // 测试数据2
 } uart_data_packet_t;
 
 // 全局队列句柄
 static QueueHandle_t uart_queue = NULL;
+
+// 目标值
+foc_target_t target = {
+        .control_mode = FOC_CONTROL_MODE_TORQUE,
+        .target_current = 0.2f,
+        .target_maxcurrent = 0.5f,
+        .target_velocity = 30.0f,
+        .target_position = 0.0f
+ };
 
 // 定义UART命令回调函数
 static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_data)
@@ -169,18 +183,47 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
             foc_openloop_set_targetSpeed(value);
             ESP_LOGI(TAG, "设置开环转速为: %d RPM", value);
             #else
-            // 如果是闭环模式，设置速度目标
-            foc_target_t target = {
-                .control_mode = FOC_CONTROL_MODE_TORQUE,
-                .target_current = value / 100.0f
-            };
-            foc_closedloop_set_target(&target);
-            ESP_LOGI(TAG, "设置闭环电流为: %.2f A", target.target_current);
+            if(target.control_mode == FOC_CONTROL_MODE_TORQUE   )
+            {
+                target.target_current = value / 100.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环电流为: %.2f A", target.target_current);
+            }
+            else if(target.control_mode == FOC_CONTROL_MODE_VELOCITY)
+            {
+                target.target_velocity = value / 10.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环速度为: %.2f RPM", target.target_velocity);
+            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION)
+            {
+                target.target_position = value / 100.0f;
+                target.target_position = fmod(target.target_position, _2PI);
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
+            }
             #endif
             break;
-            
+
         case UART_CMD_TYPE_B:
             // 处理'b'类型命令
+            if(target.control_mode == FOC_CONTROL_MODE_VELOCITY)
+            {
+                target.target_maxcurrent = value / 100.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
+            }
+            else if(target.control_mode == FOC_CONTROL_MODE_TORQUE)
+            {
+                target.target_maxcurrent = value / 100.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
+            }
+            else if(target.control_mode == FOC_CONTROL_MODE_POSITION)
+            {
+                target.target_maxcurrent = value / 100.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
+            }
             ESP_LOGI(TAG, "设置参数b为: %d", value);
             // 这里添加对b命令的具体处理
             break;
@@ -238,13 +281,13 @@ static void uart_communication_task(void* arg)
         // 从队列接收数据，等待最多50ms
         if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(50)) == pdTRUE) {
             // 发送数据到串口
-            float uart_buffer[17];
+            float uart_buffer[21];
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
             uart_buffer[3] = data.timestamp;
             uart_buffer[4] = data.speed_rpm;
-            uart_buffer[5] = data.voltage;
+            uart_buffer[5] = data.speed_rad;
             uart_buffer[6] = data.encoder_angle;
             uart_buffer[7] = data.encoder_electrical_angle;
             uart_buffer[8] = data.total_angle_raw;
@@ -256,9 +299,13 @@ static void uart_communication_task(void* arg)
             uart_buffer[14] = data.q_current;
             uart_buffer[15] = data.test_data;
             uart_buffer[16] = data.test_data2;
-            
+            uart_buffer[17] = data.target_current;
+            uart_buffer[18] = data.target_velocity;
+            uart_buffer[19] = data.target_position;
+            uart_buffer[20] = data.target_maxcurrent;
+
             // 发送数据
-            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 17);
+            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 21);
             
             // 发送帧尾
             uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f};
@@ -381,30 +428,34 @@ static void foc_control_task(void* arg)
         .current_filter_alpha = 0.005f,   // 较小的值滤波效果更强
         
         // 初始化电流PI控制器
-        .id_pi = {
-            .kp = 1.0f,     // 为d轴添加控制，保持在0电流
-            .ki = 0.0f,     // 适当的积分系数
-            .output_limit = 1.0f,
+        .id_pid = {
+            .kp = 4.5f,     // 为d轴添加控制，保持在0电流
+            .ki = 200.0f,     // 适当的积分系数
+            .kd = 0.0f,     // 不使用微分控制
+            .output_limit = 1.0f,//电压比例限幅0-1
             .integral = 0.0f
         },
-        .iq_pi = {
-            .kp = 2.0,
-            .ki = 0.0f,    // 增加积分系数提高响应性
-            .output_limit = 1.0f,
+        .iq_pid = {
+            .kp = 12.0f,
+            .ki = 500.0f,    // 增加积分系数提高响应性
+            .kd = 0.0f,     // 不使用微分控制
+            .output_limit = 1.0f,//电压比例限幅0-1
             .integral = 0.0f
         },
-        
+
         // 速度和位置控制器参数
-        .velocity_pi = {
-            .kp = 0.002f,    // 增大比例系数
-            .ki = 0.0f,     // 增大积分系数
-            .output_limit = 1.0f,
+        .velocity_pid = {
+            .kp = 0.023f,    // 比例系数
+            .ki = 0.006f,     // 积分系数
+            .kd = 0.0001f,     // 微分控制
+            .output_limit = 0.5f,//速度PID积分限幅
             .integral = 0.0f
         },
-        .position_pi = {
+        .position_pid = {
             .kp = 1.0f,
             .ki = 0.1f,
-            .output_limit = 1.0f,
+            .kd = 0.0f,     // 不使用微分控制
+            .output_limit = 100.0f,//位置PID积分限幅
             .integral = 0.0f
         }
     };
@@ -427,11 +478,8 @@ static void foc_control_task(void* arg)
     ESP_LOGI(TAG, "设置零电角度: %.2f rad", closedloop_params.zero_angle_rad);
     foc_set_PhaseVoltage(0.0f, 0.0f, 0.0f, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter); 
     vTaskDelay(pdMS_TO_TICKS(100));
-    // 设置速度目标为10 rad/s
-    foc_target_t target = {
-        .control_mode = FOC_CONTROL_MODE_TORQUE,
-        .target_current = 0.2f
-    };
+
+    // 设置目标
     foc_closedloop_set_target(&target);
     ESP_LOGI(TAG, "设置电流: %.2f A，开始闭环控制", target.target_current);
 #endif
@@ -530,8 +578,13 @@ static void foc_control_task(void* arg)
                     .duty_v = cl_state->duty_v,
                     .duty_w = cl_state->duty_w,
                     .speed_rpm = as5600_get_speed_rpm(),
+                    .speed_rad = as5600_get_speed_rad(),
                     .d_current = cl_state->id,
                     .q_current = cl_state->iq,
+                    .target_current = params->target_iq,
+                    .target_velocity = params->target_velocity,
+                    .target_position = params->target_position,
+                    .target_maxcurrent = params->target_maxcurrent,
 #endif
                     .encoder_angle = as5600_get_position(),
                     .encoder_speed = as5600_get_speed_rpm(),
