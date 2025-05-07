@@ -18,7 +18,10 @@ extern "C" {
 typedef enum {
     UART_CMD_TYPE_A = 'a',  /*!< A类型命令 */
     UART_CMD_TYPE_B = 'b',  /*!< B类型命令 */
-    UART_CMD_TYPE_V = 'v',  /*!< 电压命令 */
+    UART_CMD_TYPE_V = 'v',  /*!< V类型命令 */
+    UART_CMD_TYPE_C = 'c',  /*!< C类型命令 */
+    UART_CMD_TYPE_D = 'd',  /*!< D类型命令 */
+    UART_CMD_TYPE_E = 'e',  /*!< E类型命令 */
     // 可在此处添加更多命令类型
 } uart_cmd_type_t;
 

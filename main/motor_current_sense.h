@@ -1,13 +1,13 @@
 /*
  * 电机三相电流采样驱动
- * 使用ESP32 ADC连续转换模式
+ * 使用ESP32 ADC单次转换模式
  */
 #pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
-#include "esp_adc/adc_continuous.h"
+#include "esp_adc/adc_oneshot.h"
 #include "soc/soc_caps.h"
 
 #ifdef __cplusplus
@@ -18,10 +18,9 @@ extern "C" {
 #define CURRENT_SENSE_SHUNT_RESISTANCE  0.01f  // 10毫欧采样电阻
 #define CURRENT_SENSE_GAIN              50.0f  // 50倍放大倍数
 
-// ADC连续转换配置常量
+// ADC单次转换配置常量
 #define CURRENT_SENSE_SAMPLE_FREQ       80000  // 采样频率 80KHz
-#define CURRENT_SENSE_FRAME_SIZE        512    // 单次转换帧大小(字节)
-#define CURRENT_SENSE_MAX_BUFFER_SIZE   4096   // 最大缓冲区大小(字节)
+// 单次转换模式不需要帧大小和缓冲区大小
 
 // 电流传感器配置结构体
 typedef struct {

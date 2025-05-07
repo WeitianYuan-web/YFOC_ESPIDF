@@ -64,8 +64,8 @@ typedef struct {
 typedef enum {
     FOC_CONTROL_MODE_TORQUE = 0,  // 转矩控制模式
     FOC_CONTROL_MODE_VELOCITY = 1,    // 速度控制模式
-    FOC_CONTROL_MODE_POSITION_SIGNAL = 2,     // 位置控制模式
-    FOC_CONTROL_MODE_POSITION_RAW = 3,     // 位置控制模式
+    FOC_CONTROL_MODE_POSITION_SINGLE = 2,     // 位置控制模式
+    FOC_CONTROL_MODE_POSITION_FULL = 3,     // 位置控制模式
     FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION = 4 // 转矩速度位置控制模式
 } foc_control_mode_t;
 
@@ -104,8 +104,8 @@ typedef struct {
     foc_pid_controller_t id_pid;   // d轴电流控制器
     foc_pid_controller_t iq_pid;   // q轴电流控制器
     foc_pid_controller_t velocity_pid; // 速度控制器
-    foc_pid_controller_t position_signal_pid; // 位置控制器
-    foc_pid_controller_t position_raw_pid; // 位置控制器
+    foc_pid_controller_t position_single_pid; // 位置控制器
+    foc_pid_controller_t position_full_pid; // 位置控制器
     foc_pid_controller_t position_pid; // 位置控制器
 } foc_closedloop_params_t;
 
@@ -117,7 +117,8 @@ typedef struct {
     float id;                    // 实际d轴电流
     float iq;                    // 实际q轴电流
     float velocity;              // 实际速度(rad/s)
-    float position_rad;          // 总角度(rad)
+    float position_full;         // 总角度(rad)
+    float position_single;       // 单圈(rad)
     float electrical_angle;      // 电气角度(rad)
     
     // 控制输出
@@ -247,11 +248,11 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target);
  * @brief 设置速度和位置
  * 
  * @param velocity 当前速度(rad/s)
- * @param position_signal 当前位置(rad)
- * @param position_raw 多圈位置
+ * @param position_single 单圈位置(rad)
+ * @param position_full 多圈位置(rad)
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_motion_state(float velocity, float position_rad);
+esp_err_t foc_closedloop_set_motion_state(float velocity, float position_single, float position_full);
 
 /**
  * @brief 获取FOC闭环控制状态

@@ -17,6 +17,8 @@
 #include "motor_current_sense.h"   // 添加电流采样库头文件
 #include "uart_command.h"
 #include "motor_config.h"  // 添加电机配置头文件
+#include "esp_task_wdt.h"
+#include "esp_adc/adc_oneshot.h"  // 添加ADC单次转换头文件
 
 #define _2PI        6.28318530718f
 #define _PI         3.14159265359f
@@ -155,6 +157,7 @@ typedef struct {
     float target_velocity;   // 目标速度(RPM)
     float target_position;   // 目标位置(弧度)
     float target_maxcurrent; // 目标最大电流(安培)
+    foc_control_mode_t control_mode;
     float test_data;         // 测试数据
     float test_data2;        // 测试数据2
 } uart_data_packet_t;
@@ -164,7 +167,7 @@ static QueueHandle_t uart_queue = NULL;
 
 // 目标值
 foc_target_t target = {
-        .control_mode = FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION,
+        .control_mode = FOC_CONTROL_MODE_POSITION_SINGLE,
         .target_current = 0.2f,
         .target_maxcurrent = 0.5f,
         .target_velocity = 30.0f,
@@ -195,14 +198,14 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 target.target_velocity = value / 10.0f;
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环速度为: %.2f RPM", target.target_velocity);
-            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL)
+            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SINGLE)
             {
                 target.target_position = value / 100.0f;
                 target.target_position = fmod(target.target_position, _2PI);
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
             }
-            else if(target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
+            else if(target.control_mode == FOC_CONTROL_MODE_POSITION_FULL)
             {
                 target.target_position = value / 10.0f;
                 foc_closedloop_set_target(&target);
@@ -213,19 +216,19 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
             }
-            #endif
+#endif
             break;
 
         case UART_CMD_TYPE_B:
             // 处理'b'类型命令
-                target.target_maxcurrent = value / 100.0f;
-                foc_closedloop_set_target(&target);
-                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
-       
+            target.target_maxcurrent = value / 100.0f;
+            foc_closedloop_set_target(&target);
+            ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
+
             ESP_LOGI(TAG, "设置参数b为: %d", value);
             // 这里添加对b命令的具体处理
             break;
-            
+
         case UART_CMD_TYPE_V:
             // 处理电压控制命令
             {
@@ -235,31 +238,64 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 const float VELOCITY_SCALE = 10.0f;
 
                 float voltage = value / VOLTAGE_SCALE;
-                #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
-                if (voltage < MIN_VOLTAGE || voltage > MAX_VOLTAGE) {
-                    ESP_LOGW(TAG, "电压值超出范围 (%.1f-%.1f): %.2f", 
-                            MIN_VOLTAGE, MAX_VOLTAGE, voltage);
+#if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                if (voltage < MIN_VOLTAGE || voltage > MAX_VOLTAGE)
+                {
+                    ESP_LOGW(TAG, "电压值超出范围 (%.1f-%.1f): %.2f",
+                             MIN_VOLTAGE, MAX_VOLTAGE, voltage);
                     break;
                 }
-                    voltage = _constrain(voltage, 0.0f, 1.0f);
-                    foc_openloop_set_targetVoltage(voltage);
-                    ESP_LOGI(TAG, "设置开环电压为: %.2f V", voltage);
-                #else
-                    if (target.control_mode == FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION) {
-                        target.target_velocity = value / VELOCITY_SCALE;
-                        foc_closedloop_set_target(&target);
-                        ESP_LOGI(TAG, "设置闭环速度为: %.2f rad/s", target.target_velocity);
-                    } else {
-                        ESP_LOGW(TAG, "当前控制模式不支持速度设置");
-                    }
-                #endif
+                voltage = _constrain(voltage, 0.0f, 1.0f);
+                foc_openloop_set_targetVoltage(voltage);
+                ESP_LOGI(TAG, "设置开环电压为: %.2f V", voltage);
+#else
+
+#endif
             }
             break;
-            
+        case UART_CMD_TYPE_C:
+            // 处理'c'类型命令
+            if (target.control_mode == FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION)
+            {
+                target.target_velocity = value / 10;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环速度为: %.2f rad/s", target.target_velocity);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "当前控制模式不支持速度设置");
+            }
+            ESP_LOGI(TAG, "设置参数c为: %d", value);
+            break;
+        case UART_CMD_TYPE_D:
+            if (value == 0)
+            {
+                target.control_mode = FOC_CONTROL_MODE_TORQUE;
+            }
+            else if (value == 1)
+            {
+                target.control_mode = FOC_CONTROL_MODE_VELOCITY;
+            }
+            else if (value == 2)
+            {
+                target.control_mode = FOC_CONTROL_MODE_POSITION_SINGLE;
+            }
+            else if (value == 3)
+            {
+                target.control_mode = FOC_CONTROL_MODE_POSITION_FULL;
+            }
+            else if (value == 4)
+            {
+                target.control_mode = FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION;
+            }
+            foc_closedloop_set_target(&target);
+            // 处理'd'类型命令
+            ESP_LOGI(TAG, "设置参数d为: %d", value);
+            break;
         default:
             ESP_LOGW(TAG, "未知命令类型: %c", cmd_type);
             break;
-    }
+        }
 }
 
 // 修改串口通信任务
@@ -291,7 +327,7 @@ static void uart_communication_task(void* arg)
         // 从队列接收数据，等待最多50ms
         if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(50)) == pdTRUE) {
             // 发送数据到串口
-            float uart_buffer[21];
+            float uart_buffer[22];
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
@@ -313,9 +349,10 @@ static void uart_communication_task(void* arg)
             uart_buffer[18] = data.target_velocity;
             uart_buffer[19] = data.target_position;
             uart_buffer[20] = data.target_maxcurrent;
+            uart_buffer[21] = data.control_mode;
 
             // 发送数据
-            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 21);
+            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 22);
             
             // 发送帧尾
             uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f};
@@ -335,6 +372,20 @@ static void uart_communication_task(void* arg)
 // FOC控制任务
 static void foc_control_task(void* arg)
 {
+    // 禁用任务看门狗
+    esp_task_wdt_delete(NULL);  // 从当前任务中删除任务看门狗
+    
+    // 创建任务看门狗配置
+    esp_task_wdt_config_t twdt_config = {
+        .timeout_ms = 10000,           // 10秒超时时间
+        .idle_core_mask = 0,           // 不监视任何空闲任务
+        .trigger_panic = false         // 超时不触发panic
+    };
+    
+    // 重新初始化任务看门狗，不监视空闲任务
+    esp_task_wdt_deinit();             // 先完全卸载任务看门狗
+    esp_task_wdt_init(&twdt_config);   // 使用新配置初始化任务看门狗
+    
     inverter_handle_t inverter = (inverter_handle_t)arg;
     
     uint8_t count = 0;
@@ -351,11 +402,11 @@ static void foc_control_task(void* arg)
         adc_channel_t v_channel;
         
         esp_err_t ret;
-        ret = adc_continuous_io_to_channel(CURRENT_SENSE_U_PIN, &u_unit, &u_channel);
+        ret = adc_oneshot_io_to_channel(CURRENT_SENSE_U_PIN, &u_unit, &u_channel);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "GPIO %d不是有效的ADC引脚", CURRENT_SENSE_U_PIN);
         } else {
-            ret = adc_continuous_io_to_channel(CURRENT_SENSE_V_PIN, &v_unit, &v_channel);
+            ret = adc_oneshot_io_to_channel(CURRENT_SENSE_V_PIN, &v_unit, &v_channel);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "GPIO %d不是有效的ADC引脚", CURRENT_SENSE_V_PIN);
             } else {
@@ -367,7 +418,7 @@ static void foc_control_task(void* arg)
                     .u_phase_channel = u_channel,
                     .v_phase_unit = v_unit,
                     .v_phase_channel = v_channel,
-                    .sample_freq_hz = 80000,          // 80kHz采样频率
+                    .sample_freq_hz = 80000,          // 连续转换80kHz采样频率，单次转换使用不到
                     .zero_current_adc_u = 2048.0f,    // 默认零点值
                     .zero_current_adc_v = 2048.0f,    // 默认零点值
                     .use_w_calculation = true         // 通过计算得到W相电流
@@ -380,7 +431,7 @@ static void foc_control_task(void* arg)
                     ESP_LOGI(TAG, "开始电流传感器零点校准");
                     ret = current_sense_calibrate(100);  // 采集100个样本进行校准
                     if (ret == ESP_OK) {
-                        // 启动ADC连续转换
+                        // 启动ADC单次转换
                         ret = current_sense_start();
                         if (ret == ESP_OK) {
                             g_current_sense_initialized = true;
@@ -461,14 +512,14 @@ static void foc_control_task(void* arg)
             .output_limit = 1.0f,//速度PID积分限幅
             .integral = 0.0f
         },
-        .position_signal_pid = {
+        .position_single_pid = {
             .kp = 0.35f,
             .ki = 0.1f,
             .kd = 0.00001f,     // 微分控制
             .output_limit = 0.8f,//位置PID积分限幅
             .integral = 0.0f
         },
-        .position_raw_pid = {
+        .position_full_pid = {
             .kp = 0.22f,
             .ki = 0.12f,
             .kd = 0.001f,     // 微分控制
@@ -515,8 +566,8 @@ static void foc_control_task(void* arg)
     foc_uvw_coord_t phase_currents = {.u = _IQ(0), .v = _IQ(0), .w = _IQ(0)};
     foc_dq_coord_t dq_currents = {.d = _IQ(0), .q = _IQ(0)};
     float velocity = 0;
-    float position_signal = 0;
-    float position_rad = 0;
+    float position_single = 0;
+    float position_full = 0;
 
     while (true) {
         // 等待定时器触发
@@ -561,8 +612,9 @@ static void foc_control_task(void* arg)
 #else
             // 闭环控制
             velocity = as5600_get_speed_rad();
-            position_rad = as5600_get_total_angle_rad();
-            foc_closedloop_set_motion_state(velocity, position_rad);
+            position_single = as5600_get_position();
+            position_full = as5600_get_total_angle_rad();
+            foc_closedloop_set_motion_state(velocity, position_single, position_full);
             foc_closedloop_output(inverter, &phase_currents, _IQ(electrical_angle));
 
 
@@ -611,6 +663,7 @@ static void foc_control_task(void* arg)
                     .target_velocity = params->target_velocity,
                     .target_position = params->target_position,
                     .target_maxcurrent = params->target_maxcurrent,
+                    .control_mode = params->control_mode,
 #endif
                     .encoder_angle = as5600_get_position(),
                     .encoder_speed = as5600_get_speed_rpm(),

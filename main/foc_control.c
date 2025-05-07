@@ -437,55 +437,55 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
             }
             break;
             
-        case FOC_CONTROL_MODE_POSITION_SIGNAL:
+        case FOC_CONTROL_MODE_POSITION_SINGLE:
             // 位置控制模式：通过位置PI控制器计算速度目标，再通过速度PI控制器计算q轴电流目标
             {   
                 target_position = s_closedloop_params.target_position;
-                float position_error = target_position - p_cl_state->position_rad;
+                float position_error = target_position - p_cl_state->position_single;
                 position_error = cycle_diff(position_error, _2PI);
-                float pos_derivative = (position_error - s_closedloop_params.position_signal_pid.last_error) / dt;
-                s_closedloop_params.position_signal_pid.last_error = position_error;
-                float p_pos = s_closedloop_params.position_signal_pid.kp * position_error;
-                float d_pos = s_closedloop_params.position_signal_pid.kd * pos_derivative;
+                float pos_derivative = (position_error - s_closedloop_params.position_single_pid.last_error) / dt;
+                s_closedloop_params.position_single_pid.last_error = position_error;
+                float p_pos = s_closedloop_params.position_single_pid.kp * position_error;
+                float d_pos = s_closedloop_params.position_single_pid.kd * pos_derivative;
                 float pd_pos = p_pos + d_pos;
-                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_signal_pid.output_limit, s_closedloop_params.position_signal_pid.output_limit);
+                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_single_pid.output_limit, s_closedloop_params.position_single_pid.output_limit);
                 if (fabs(position_error) < 1.57f) {
-                    s_closedloop_params.position_signal_pid.integral += position_error * dt;
-                    s_closedloop_params.position_signal_pid.integral = _constrain(s_closedloop_params.position_signal_pid.integral, -50.0f, 50.0f);
+                    s_closedloop_params.position_single_pid.integral += position_error * dt;
+                    s_closedloop_params.position_single_pid.integral = _constrain(s_closedloop_params.position_single_pid.integral, -50.0f, 50.0f);
                 } else {
-                    s_closedloop_params.position_signal_pid.integral = 0.0f;
+                    s_closedloop_params.position_single_pid.integral = 0.0f;
                 }
-                target_iq = pd_pos + s_closedloop_params.position_signal_pid.integral * s_closedloop_params.position_signal_pid.ki;
+                target_iq = pd_pos + s_closedloop_params.position_single_pid.integral * s_closedloop_params.position_single_pid.ki;
             }
             break;
             
-        case FOC_CONTROL_MODE_POSITION_RAW:
+        case FOC_CONTROL_MODE_POSITION_FULL:
             {
                 // 位置控制模式：直接使用设定的位置目标值
                 target_position = s_closedloop_params.target_position;
-                float position_error = target_position - p_cl_state->position_rad;
-                float pos_derivative = (position_error - s_closedloop_params.position_raw_pid.last_error) / dt;
-                s_closedloop_params.position_raw_pid.last_error = position_error;
-                float p_pos = s_closedloop_params.position_raw_pid.kp * position_error;
-                float d_pos = s_closedloop_params.position_raw_pid.kd * pos_derivative;
+                float position_error = target_position - p_cl_state->position_full;
+                float pos_derivative = (position_error - s_closedloop_params.position_full_pid.last_error) / dt;
+                s_closedloop_params.position_full_pid.last_error = position_error;
+                float p_pos = s_closedloop_params.position_full_pid.kp * position_error;
+                float d_pos = s_closedloop_params.position_full_pid.kd * pos_derivative;
                 float pd_pos = p_pos + d_pos;
                 if (fabs(position_error) < 1.57f) {
-                    s_closedloop_params.position_raw_pid.integral += position_error * dt;
-                    s_closedloop_params.position_raw_pid.integral = _constrain(s_closedloop_params.position_raw_pid.integral, -10.0f, 10.0f);
+                    s_closedloop_params.position_full_pid.integral += position_error * dt;
+                    s_closedloop_params.position_full_pid.integral = _constrain(s_closedloop_params.position_full_pid.integral, -10.0f, 10.0f);
                 } else {
-                    s_closedloop_params.position_raw_pid.integral *= 0.98f;
+                    s_closedloop_params.position_full_pid.integral *= 0.98f;
                 }
-                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_raw_pid.output_limit, s_closedloop_params.position_raw_pid.output_limit);
-                target_iq = pd_pos + s_closedloop_params.position_raw_pid.integral * s_closedloop_params.position_raw_pid.ki;
+                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_full_pid.output_limit, s_closedloop_params.position_full_pid.output_limit);
+                target_iq = pd_pos + s_closedloop_params.position_full_pid.integral * s_closedloop_params.position_full_pid.ki;
             }
             break;
-            
+
         case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
             // 转矩速度位置控制模式：综合考虑三个控制目标
             {   
                 target_position = s_closedloop_params.target_position;
                 target_velocity = s_closedloop_params.target_velocity;
-                float position_error = target_position - p_cl_state->position_rad;
+                float position_error = target_position - p_cl_state->position_full;
                 float position_velocity = foc_pid_controller_update(&s_closedloop_params.position_pid, position_error, dt);
                 position_velocity = _constrain(position_velocity, -target_velocity, target_velocity);
                 if (fabs(position_error) < 1.57f) {
@@ -573,6 +573,7 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
     float target_maxcurrent = target->target_maxcurrent;
     if (target_maxcurrent > max_current) {
         target_maxcurrent = max_current;
+        ESP_LOGW(TAG, "目标电流超过电流限制数值，设置为目标电流为限制电流");
     }
 
     // 根据控制模式设置相应的目标值
@@ -592,12 +593,12 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
             s_closedloop_params.target_maxcurrent = target_maxcurrent;
             break;
             
-        case FOC_CONTROL_MODE_POSITION_SIGNAL:
+        case FOC_CONTROL_MODE_POSITION_SINGLE:
             // 位置控制模式：设置位置目标值
             s_closedloop_params.target_position = target->target_position;
             s_closedloop_params.target_maxcurrent = target_maxcurrent;
             break;
-        case FOC_CONTROL_MODE_POSITION_RAW:
+        case FOC_CONTROL_MODE_POSITION_FULL:
             // 位置控制模式：设置位置目标值
             s_closedloop_params.target_position = target->target_position;
             s_closedloop_params.target_maxcurrent = target_maxcurrent;
@@ -623,12 +624,15 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
             case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
                 s_closedloop_params.velocity_pid.integral = 0;
                 s_closedloop_params.position_pid.integral = 0;
+                s_closedloop_params.target_position = p_cl_state->position_full;
                 break;
-            case FOC_CONTROL_MODE_POSITION_SIGNAL:
-                s_closedloop_params.position_pid.integral = 0;
+            case FOC_CONTROL_MODE_POSITION_SINGLE:
+                s_closedloop_params.position_single_pid.integral = 0;
+                s_closedloop_params.target_position = p_cl_state->position_single;
                 break;
-            case FOC_CONTROL_MODE_POSITION_RAW:
-                s_closedloop_params.position_pid.integral = 0;
+            case FOC_CONTROL_MODE_POSITION_FULL:
+                s_closedloop_params.position_full_pid.integral = 0;
+                s_closedloop_params.target_position = p_cl_state->position_full;
                 break;
             default:
                 break;
@@ -648,18 +652,19 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
  * @brief 设置速度和位置
  * 
  * @param velocity 当前速度(rad/s)
- * @param position_signal 当前位置(rad)
- * @param position_raw 多圈位置
+ * @param position_single 单圈位置(rad)
+ * @param position_full 多圈位置(rad)
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_motion_state(float velocity, float position_rad)
+esp_err_t foc_closedloop_set_motion_state(float velocity, float position_single, float position_full)
 {
     if (!s_cl_is_initialized || !p_cl_state) {
         return ESP_ERR_INVALID_STATE;
     }
     
     p_cl_state->velocity = velocity;
-    p_cl_state->position_rad = position_rad;
+    p_cl_state->position_full = position_full;
+    p_cl_state->position_single = position_single;
     
     return ESP_OK;
 }
@@ -705,19 +710,17 @@ esp_err_t foc_closedloop_stop(void)
             // 对于速度控制，设置目标速度为0
             s_closedloop_params.target_velocity = 0;
             break;
-        case FOC_CONTROL_MODE_POSITION_SIGNAL:
+        case FOC_CONTROL_MODE_POSITION_SINGLE:
             // 对于位置控制，保持当前位置
-            s_closedloop_params.target_position = p_cl_state->position_rad;
+            s_closedloop_params.target_position = p_cl_state->position_single;
             break;
-        case FOC_CONTROL_MODE_POSITION_RAW:
+        case FOC_CONTROL_MODE_POSITION_FULL:
             // 对于位置控制，保持当前位置
-            s_closedloop_params.target_position = p_cl_state->position_rad;
+            s_closedloop_params.target_position = p_cl_state->position_full;
             break;
         case FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION:
-            // 对于转矩速度位置控制，保持当前状态
-            s_closedloop_params.target_iq = p_cl_state->iq;
-            s_closedloop_params.target_velocity = p_cl_state->velocity;
-            s_closedloop_params.target_position = p_cl_state->position_rad;
+            // 对于转矩速度位置控制，保持当前位置
+            s_closedloop_params.target_position = p_cl_state->position_full;
             break;
     }
     
