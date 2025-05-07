@@ -658,13 +658,23 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
  */
 esp_err_t foc_closedloop_set_motion_state(float velocity, float position_single, float position_full)
 {
-    if (!s_cl_is_initialized || !p_cl_state) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    // 检查初始化状态
+    ESP_RETURN_ON_FALSE(s_cl_is_initialized, ESP_ERR_INVALID_STATE, TAG, "FOC闭环控制未初始化");
+    ESP_RETURN_ON_FALSE(p_cl_state, ESP_ERR_INVALID_STATE, TAG, "FOC闭环状态指针为NULL");
     
+    // 检查参数是否为NaN
+    ESP_RETURN_ON_FALSE(!isnan(velocity), ESP_ERR_INVALID_ARG, TAG, "速度参数为NaN");
+    ESP_RETURN_ON_FALSE(!isnan(position_single), ESP_ERR_INVALID_ARG, TAG, "单圈位置参数为NaN");
+    ESP_RETURN_ON_FALSE(!isnan(position_full), ESP_ERR_INVALID_ARG, TAG, "多圈位置参数为NaN");
+    
+    // 更新运动状态
     p_cl_state->velocity = velocity;
-    p_cl_state->position_full = position_full;
     p_cl_state->position_single = position_single;
+    p_cl_state->position_full = position_full;
+    
+    // 记录调试信息
+    ESP_LOGD(TAG, "更新运动状态: 速度=%.3f rad/s, 单圈位置=%.3f rad, 多圈位置=%.3f rad",
+             velocity, position_single, position_full);
     
     return ESP_OK;
 }

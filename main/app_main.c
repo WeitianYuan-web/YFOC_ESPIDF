@@ -123,8 +123,25 @@ static bool g_current_sense_initialized = false;
 // FOC控制定时器回调函数
 static void foc_timer_callback(void* arg)
 {
+    // 安全检查
+    if (foc_timer_semaphore == NULL) {
+        ESP_LOGW(TAG, "FOC定时器回调：信号量句柄为NULL");
+        return;
+    }
+    
     // 通知FOC任务执行控制循环
-    xSemaphoreGiveFromISR(foc_timer_semaphore, NULL);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    BaseType_t result = xSemaphoreGiveFromISR(foc_timer_semaphore, &xHigherPriorityTaskWoken);
+    
+    if (result != pdTRUE) {
+        // 信号量给予失败，可能是队列已满，这是异常情况
+        // 中断上下文中不应使用ESP_LOGX，此处仅表明需处理此情况
+    }
+    
+    // 如果释放信号量导致高优先级任务就绪，请求上下文切换
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 // 定义串口任务常量
@@ -307,6 +324,12 @@ static void uart_communication_task(void* arg)
     
     ESP_LOGI(TAG, "串口通信任务已启动在核心%d上", UART_TASK_CORE_ID);
     
+    // 添加到看门狗监控
+    esp_err_t err = esp_task_wdt_add(NULL);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "添加UART任务到看门狗失败: %s", esp_err_to_name(err));
+    }
+    
     // 初始化UART命令处理器
     uart_cmd_config_t cmd_config = {
         .uart_port = UART_NUM,
@@ -317,17 +340,30 @@ static void uart_communication_task(void* arg)
     
     esp_err_t ret = uart_cmd_init(&cmd_config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "UART命令处理器初始化失败: %d", ret);
+        ESP_LOGE(TAG, "UART命令处理器初始化失败: %s", esp_err_to_name(ret));
+        vTaskDelete(NULL);  // 任务无法继续，删除自身
+        return;
     }
     
+    // 任务主循环
     while (true) {
         // 处理串口命令
         uart_cmd_process(10); // 10ms超时
         
+        // 重置任务看门狗
+        esp_task_wdt_reset();
+        
+        // 检查任务是否收到删除请求
+        if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+            break;  // 如果调度器已停止，退出循环
+        }
+        
         // 从队列接收数据，等待最多50ms
-        if (xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (uart_queue != NULL && xQueueReceive(uart_queue, &data, pdMS_TO_TICKS(50)) == pdTRUE) {
             // 发送数据到串口
             float uart_buffer[22];
+            
+            // 填充缓冲区数据
             uart_buffer[0] = data.duty_u;
             uart_buffer[1] = data.duty_v;
             uart_buffer[2] = data.duty_w;
@@ -351,12 +387,19 @@ static void uart_communication_task(void* arg)
             uart_buffer[20] = data.target_maxcurrent;
             uart_buffer[21] = data.control_mode;
 
-            // 发送数据
-            uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 22);
+            // 发送数据，检查是否成功
+            int tx_bytes = uart_write_bytes(UART_NUM, (const char*)uart_buffer, sizeof(float) * 22);
+            if (tx_bytes < 0) {
+                ESP_LOGW(TAG, "UART发送数据失败");
+                continue;  // 继续下一轮循环
+            }
             
             // 发送帧尾
             uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f};
-            uart_write_bytes(UART_NUM, (const char*)tail, 4);
+            tx_bytes = uart_write_bytes(UART_NUM, (const char*)tail, 4);
+            if (tx_bytes < 0) {
+                ESP_LOGW(TAG, "UART发送帧尾失败");
+            }
             
             // 每两秒打印一次系统状态
             current_time = esp_timer_get_time() / 1000; // 毫秒
@@ -367,26 +410,45 @@ static void uart_communication_task(void* arg)
             }
         }
     }
+    
+    // 清理资源
+    uart_cmd_deinit();
+    // 从看门狗中移除任务
+    esp_task_wdt_delete(NULL);
+    ESP_LOGI(TAG, "串口通信任务已退出");
 }
 
 // FOC控制任务
 static void foc_control_task(void* arg)
 {
-    // 禁用任务看门狗
-    esp_task_wdt_delete(NULL);  // 从当前任务中删除任务看门狗
-    
-    // 创建任务看门狗配置
+    // 不再禁用看门狗，而是延长其超时时间并保持启用
     esp_task_wdt_config_t twdt_config = {
         .timeout_ms = 10000,           // 10秒超时时间
         .idle_core_mask = 0,           // 不监视任何空闲任务
         .trigger_panic = false         // 超时不触发panic
     };
     
-    // 重新初始化任务看门狗，不监视空闲任务
-    esp_task_wdt_deinit();             // 先完全卸载任务看门狗
-    esp_task_wdt_init(&twdt_config);   // 使用新配置初始化任务看门狗
+    // 重新配置任务看门狗，而不是禁用它
+    esp_err_t err = esp_task_wdt_reconfigure(&twdt_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "重新配置任务看门狗失败: %s", esp_err_to_name(err));
+    }
+
+    // 确保当前任务被添加到看门狗监控中
+    err = esp_task_wdt_add(NULL);  // NULL表示当前任务
+    if (err != ESP_OK && err != ESP_ERR_INVALID_ARG) {
+        // ESP_ERR_INVALID_ARG可能意味着任务已经被添加
+        ESP_LOGW(TAG, "添加任务到看门狗失败: %s", esp_err_to_name(err));
+    }
     
     inverter_handle_t inverter = (inverter_handle_t)arg;
+    if (inverter == NULL) {
+        ESP_LOGE(TAG, "无效的逆变器句柄");
+        // 退出前从看门狗中移除任务
+        esp_task_wdt_delete(NULL);
+        vTaskDelete(NULL);
+        return;
+    }
     
     uint8_t count = 0;
     
@@ -574,6 +636,9 @@ static void foc_control_task(void* arg)
         if (xSemaphoreTake(foc_timer_semaphore, portMAX_DELAY) == pdTRUE) {
             dt = esp_timer_get_time() - last_update_time;
             last_update_time = esp_timer_get_time();
+            
+            // 重置任务看门狗，防止超时
+            esp_task_wdt_reset();
             
             // ======== 传感器采集部分 ========
             // 在闭环模式或Debug模式下采集传感器数据
@@ -783,16 +848,62 @@ void app_main(void)
     
     // 创建FOC控制定时器信号量
     foc_timer_semaphore = xSemaphoreCreateBinary();
+    if (foc_timer_semaphore == NULL) {
+        ESP_LOGE(TAG, "无法创建FOC定时器信号量");
+        goto cleanup;
+    }
     
-    // 创建高精度定时器，周期为 1/4000 秒
+    // 配置全局任务看门狗，增加超时时间
+    esp_task_wdt_config_t twdt_config = {
+        .timeout_ms = 10000,           // 10秒超时时间
+        .idle_core_mask = 0,           // 不监视空闲任务
+        .trigger_panic = false         // 超时不触发panic
+    };
+    
+    // 如果看门狗已初始化，则重新配置
+    esp_err_t wdt_ret = esp_task_wdt_reconfigure(&twdt_config);
+    if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "重新配置任务看门狗失败: %s", esp_err_to_name(wdt_ret));
+    } else if (wdt_ret == ESP_ERR_INVALID_STATE) {
+        // 看门狗未初始化，进行初始化
+        wdt_ret = esp_task_wdt_init(&twdt_config);
+        if (wdt_ret != ESP_OK) {
+            ESP_LOGW(TAG, "初始化任务看门狗失败: %s", esp_err_to_name(wdt_ret));
+        } else {
+            ESP_LOGI(TAG, "任务看门狗已初始化");
+        }
+    }
+    
+    // 创建高精度定时器，周期为 1/FOC_CONTROL_FREQ_HZ 秒
     const esp_timer_create_args_t timer_args = {
         .callback = &foc_timer_callback,
         .name = "foc_timer"
     };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &foc_timer_handle));
+    esp_err_t ret = esp_timer_create(&timer_args, &foc_timer_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "创建FOC定时器失败: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
+    
+    // 创建通信队列
+    uart_queue = xQueueCreate(UART_QUEUE_SIZE, sizeof(uart_data_packet_t));
+    if (uart_queue == NULL) {
+        ESP_LOGE(TAG, "无法创建UART数据队列");
+        goto cleanup;
+    }
+    
+    // 初始化AS5600编码器
+    ret = as5600_init(AS5600_SDA_PIN, AS5600_SCL_PIN, AS5600_I2C_FREQ, AS5600_I2C_PORT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "初始化编码器失败: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
+    
+    // 设置编码器采样周期 (与FOC控制频率相同)
+    as5600_set_dt(1.0f / FOC_CONTROL_FREQ_HZ);
     
     // 创建FOC控制任务
-    xTaskCreatePinnedToCore(
+    BaseType_t task_created = xTaskCreatePinnedToCore(
         foc_control_task,       // 任务函数
         "foc_task",             // 任务名称
         FOC_TASK_STACK_SIZE,    // 栈大小
@@ -802,17 +913,13 @@ void app_main(void)
         FOC_TASK_CORE_ID        // 运行的核心
     );
     
-    // 初始化AS5600编码器
-    ESP_ERROR_CHECK(as5600_init(AS5600_SDA_PIN, AS5600_SCL_PIN, AS5600_I2C_FREQ, AS5600_I2C_PORT));
-    
-    // 设置编码器采样周期 (与FOC控制频率相同)
-    as5600_set_dt(1.0f / FOC_CONTROL_FREQ_HZ);
-    
-    // 创建通信队列
-    uart_queue = xQueueCreate(UART_QUEUE_SIZE, sizeof(uart_data_packet_t));
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "创建FOC控制任务失败");
+        goto cleanup;
+    }
     
     // 创建串口通信任务
-    xTaskCreatePinnedToCore(
+    task_created = xTaskCreatePinnedToCore(
         uart_communication_task, // 任务函数
         "uart_task",            // 任务名称
         UART_TASK_STACK_SIZE,   // 栈大小
@@ -822,8 +929,17 @@ void app_main(void)
         UART_TASK_CORE_ID       // 运行的核心
     );
     
-    // 启动定时器，周期为1/2000秒 (500微秒)
-    ESP_ERROR_CHECK(esp_timer_start_periodic(foc_timer_handle, 1000000 / FOC_CONTROL_FREQ_HZ));
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "创建UART通信任务失败");
+        goto cleanup;
+    }
+    
+    // 启动定时器，周期为1/FOC_CONTROL_FREQ_HZ秒
+    ret = esp_timer_start_periodic(foc_timer_handle, 1000000 / FOC_CONTROL_FREQ_HZ);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "启动FOC定时器失败: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
     
     ESP_LOGI(TAG, "系统初始化完成，带编码器反馈的FOC控制");
     
@@ -832,16 +948,34 @@ void app_main(void)
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     
-    // 下面的代码不会执行到，除非在主循环添加退出条件
-    ESP_ERROR_CHECK(esp_timer_stop(foc_timer_handle));
-    ESP_ERROR_CHECK(esp_timer_delete(foc_timer_handle));
-    vTaskDelete(foc_task_handle);
-    
+cleanup:
     // 清理资源
+    if (foc_timer_handle != NULL) {
+        esp_timer_stop(foc_timer_handle);
+        esp_timer_delete(foc_timer_handle);
+        foc_timer_handle = NULL;
+    }
+    
+    if (foc_task_handle != NULL) {
+        vTaskDelete(foc_task_handle);
+        foc_task_handle = NULL;
+    }
+    
+    if (foc_timer_semaphore != NULL) {
+        vSemaphoreDelete(foc_timer_semaphore);
+        foc_timer_semaphore = NULL;
+    }
+    
+    if (uart_queue != NULL) {
+        vQueueDelete(uart_queue);
+        uart_queue = NULL;
+    }
+    
+    // 关闭驱动和释放资源
     foc_openloop_stop();
     bsp_bridge_driver_enable(false);
-    ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_STOP_EMPTY));
-    ESP_ERROR_CHECK(svpwm_del_inverter(inverter1));
+    svpwm_inverter_start(inverter1, MCPWM_TIMER_STOP_EMPTY);
+    svpwm_del_inverter(inverter1);
     uart_driver_delete(UART_NUM);
     
     // 如果电流采样模块已初始化，则释放资源
@@ -849,4 +983,6 @@ void app_main(void)
         current_sense_stop();
         current_sense_deinit();
     }
+    
+    ESP_LOGE(TAG, "系统初始化失败，程序退出");
 }
