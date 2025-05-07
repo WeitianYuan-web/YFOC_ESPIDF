@@ -317,11 +317,6 @@ esp_err_t foc_closedloop_init(const foc_closedloop_params_t *params, foc_closedl
     ESP_RETURN_ON_FALSE(params->voltage_limit > 0 && params->voltage_limit <= 1.0f, 
                       ESP_ERR_INVALID_ARG, TAG, "voltage_limit must be in range (0, 1]");
     
-    // 验证PI控制器参数
-    ESP_RETURN_ON_FALSE(params->id_pid.output_limit > 0 && params->id_pid.output_limit <= 1.0f,
-                      ESP_ERR_INVALID_ARG, TAG, "id_pid.output_limit must be in range (0, 1]");
-    ESP_RETURN_ON_FALSE(params->iq_pid.output_limit > 0 && params->iq_pid.output_limit <= 1.0f,
-                      ESP_ERR_INVALID_ARG, TAG, "iq_pid.output_limit must be in range (0, 1]");
     
     if (state) {
         p_cl_state = state;
@@ -438,7 +433,7 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
 
                     s_closedloop_params.velocity_pid.integral *= 0.98f;
                 }
-                target_iq = pd_vel + s_closedloop_params.velocity_pid.integral;
+                target_iq = pd_vel + s_closedloop_params.velocity_pid.integral * s_closedloop_params.velocity_pid.ki;
             }
             break;
             
@@ -446,9 +441,21 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
             // 位置控制模式：通过位置PI控制器计算速度目标，再通过速度PI控制器计算q轴电流目标
             {   
                 target_position = s_closedloop_params.target_position;
-                float position_error = target_position - p_cl_state->position_signal;
+                float position_error = target_position - p_cl_state->position_rad;
                 position_error = cycle_diff(position_error, _2PI);
-                target_iq = foc_pid_controller_update(&s_closedloop_params.position_signal_pid, position_error, dt);
+                float pos_derivative = (position_error - s_closedloop_params.position_signal_pid.last_error) / dt;
+                s_closedloop_params.position_signal_pid.last_error = position_error;
+                float p_pos = s_closedloop_params.position_signal_pid.kp * position_error;
+                float d_pos = s_closedloop_params.position_signal_pid.kd * pos_derivative;
+                float pd_pos = p_pos + d_pos;
+                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_signal_pid.output_limit, s_closedloop_params.position_signal_pid.output_limit);
+                if (fabs(position_error) < 1.57f) {
+                    s_closedloop_params.position_signal_pid.integral += position_error * dt;
+                    s_closedloop_params.position_signal_pid.integral = _constrain(s_closedloop_params.position_signal_pid.integral, -50.0f, 50.0f);
+                } else {
+                    s_closedloop_params.position_signal_pid.integral = 0.0f;
+                }
+                target_iq = pd_pos + s_closedloop_params.position_signal_pid.integral * s_closedloop_params.position_signal_pid.ki;
             }
             break;
             
@@ -457,7 +464,19 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
                 // 位置控制模式：直接使用设定的位置目标值
                 target_position = s_closedloop_params.target_position;
                 float position_error = target_position - p_cl_state->position_rad;
-                target_iq = foc_pid_controller_update(&s_closedloop_params.position_raw_pid, position_error, dt);
+                float pos_derivative = (position_error - s_closedloop_params.position_raw_pid.last_error) / dt;
+                s_closedloop_params.position_raw_pid.last_error = position_error;
+                float p_pos = s_closedloop_params.position_raw_pid.kp * position_error;
+                float d_pos = s_closedloop_params.position_raw_pid.kd * pos_derivative;
+                float pd_pos = p_pos + d_pos;
+                if (fabs(position_error) < 1.57f) {
+                    s_closedloop_params.position_raw_pid.integral += position_error * dt;
+                    s_closedloop_params.position_raw_pid.integral = _constrain(s_closedloop_params.position_raw_pid.integral, -10.0f, 10.0f);
+                } else {
+                    s_closedloop_params.position_raw_pid.integral *= 0.98f;
+                }
+                pd_pos = _constrain(pd_pos, -s_closedloop_params.position_raw_pid.output_limit, s_closedloop_params.position_raw_pid.output_limit);
+                target_iq = pd_pos + s_closedloop_params.position_raw_pid.integral * s_closedloop_params.position_raw_pid.ki;
             }
             break;
             
@@ -466,15 +485,17 @@ esp_err_t foc_closedloop_output(inverter_handle_t inverter, const foc_uvw_coord_
             {   
                 target_position = s_closedloop_params.target_position;
                 target_velocity = s_closedloop_params.target_velocity;
-                float position_error = target_position - p_cl_state->position_signal;
+                float position_error = target_position - p_cl_state->position_rad;
                 float position_velocity = foc_pid_controller_update(&s_closedloop_params.position_pid, position_error, dt);
-                float velocity_error = target_velocity - p_cl_state->velocity;
+                position_velocity = _constrain(position_velocity, -target_velocity, target_velocity);
+                if (fabs(position_error) < 1.57f) {
+                    s_closedloop_params.position_pid.integral = _constrain(s_closedloop_params.position_pid.integral, -10.0f, 10.0f);
+                } else {
+                    s_closedloop_params.position_pid.integral *= 0.98f;
+                }
+                float velocity_error = position_velocity - p_cl_state->velocity;
                 float velocity_iq = foc_pid_controller_update(&s_closedloop_params.velocity_pid, velocity_error, dt);
-                // 在三个控制目标之间选择最小的值
-                float min_iq = fabsf(target_iq);
-                if (fabsf(velocity_iq) < min_iq) min_iq = fabsf(velocity_iq);
-                if (fabsf(position_velocity) < min_iq) min_iq = fabsf(position_velocity);
-                target_iq = (target_iq > 0) ? min_iq : -min_iq;
+                target_iq = velocity_iq;
             }
             break;
             
@@ -631,14 +652,13 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target)
  * @param position_raw 多圈位置
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_motion_state(float velocity, float position_signal, float position_rad)
+esp_err_t foc_closedloop_set_motion_state(float velocity, float position_rad)
 {
     if (!s_cl_is_initialized || !p_cl_state) {
         return ESP_ERR_INVALID_STATE;
     }
     
     p_cl_state->velocity = velocity;
-    p_cl_state->position_signal = position_signal;
     p_cl_state->position_rad = position_rad;
     
     return ESP_OK;
@@ -687,7 +707,7 @@ esp_err_t foc_closedloop_stop(void)
             break;
         case FOC_CONTROL_MODE_POSITION_SIGNAL:
             // 对于位置控制，保持当前位置
-            s_closedloop_params.target_position = p_cl_state->position_signal;
+            s_closedloop_params.target_position = p_cl_state->position_rad;
             break;
         case FOC_CONTROL_MODE_POSITION_RAW:
             // 对于位置控制，保持当前位置

@@ -117,7 +117,6 @@ typedef struct {
     float id;                    // 实际d轴电流
     float iq;                    // 实际q轴电流
     float velocity;              // 实际速度(rad/s)
-    float position_signal;       // 实际位置(rad)
     float position_rad;          // 总角度(rad)
     float electrical_angle;      // 电气角度(rad)
     
@@ -252,7 +251,7 @@ esp_err_t foc_closedloop_set_target(const foc_target_t *target);
  * @param position_raw 多圈位置
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t foc_closedloop_set_motion_state(float velocity, float position_signal, float position_raw);
+esp_err_t foc_closedloop_set_motion_state(float velocity, float position_rad);
 
 /**
  * @brief 获取FOC闭环控制状态

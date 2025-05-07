@@ -164,7 +164,7 @@ static QueueHandle_t uart_queue = NULL;
 
 // 目标值
 foc_target_t target = {
-        .control_mode = FOC_CONTROL_MODE_POSITION_RAW,
+        .control_mode = FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION,
         .target_current = 0.2f,
         .target_maxcurrent = 0.5f,
         .target_velocity = 30.0f,
@@ -195,10 +195,21 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
                 target.target_velocity = value / 10.0f;
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环速度为: %.2f RPM", target.target_velocity);
-            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL || target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
+            }else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL)
             {
                 target.target_position = value / 100.0f;
                 target.target_position = fmod(target.target_position, _2PI);
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
+            }
+            else if(target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
+            {
+                target.target_position = value / 10.0f;
+                foc_closedloop_set_target(&target);
+                ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
+            }else if(target.control_mode == FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION)
+            {
+                target.target_position = value / 10.0f;
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环位置为: %.2f rad", target.target_position);
             }
@@ -207,43 +218,41 @@ static void uart_cmd_handler(uart_cmd_type_t cmd_type, int value, void* user_dat
 
         case UART_CMD_TYPE_B:
             // 处理'b'类型命令
-            if(target.control_mode == FOC_CONTROL_MODE_VELOCITY)
-            {
                 target.target_maxcurrent = value / 100.0f;
                 foc_closedloop_set_target(&target);
                 ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
-            }
-            else if(target.control_mode == FOC_CONTROL_MODE_TORQUE)
-            {
-                target.target_maxcurrent = value / 100.0f;
-                foc_closedloop_set_target(&target);
-                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
-            }
-            else if(target.control_mode == FOC_CONTROL_MODE_POSITION_SIGNAL || target.control_mode == FOC_CONTROL_MODE_POSITION_RAW)
-            {
-                target.target_maxcurrent = value / 100.0f;
-                foc_closedloop_set_target(&target);
-                ESP_LOGI(TAG, "设置闭环最大电流为: %.2f A", target.target_maxcurrent);
-            }
+       
             ESP_LOGI(TAG, "设置参数b为: %d", value);
             // 这里添加对b命令的具体处理
             break;
             
         case UART_CMD_TYPE_V:
-            // 处理电压命令
+            // 处理电压控制命令
             {
-                float voltage = value / 100.0f;
-                if (voltage >= 0.0f && voltage <= 1.0f) {
-                    #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
-                    foc_openloop_set_targetVoltage(voltage);
-                    ESP_LOGI(TAG, "设置开环电压为: %.2f", voltage);
-                    #else
-                    //foc_closedloop_set_target(FOC_CONTROL_MODE_TORQUE, voltage);
-                    ESP_LOGI(TAG, "设置闭环电压为: %.2f", voltage);
-                    #endif
-                } else {
-                    ESP_LOGW(TAG, "电压值超出范围 (0.0-1.0): %.2f", voltage);
+                const float VOLTAGE_SCALE = 100.0f;
+                const float MIN_VOLTAGE = 0.0f;
+                const float MAX_VOLTAGE = 1.0f;
+                const float VELOCITY_SCALE = 10.0f;
+
+                float voltage = value / VOLTAGE_SCALE;
+                #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_OPENLOOP
+                if (voltage < MIN_VOLTAGE || voltage > MAX_VOLTAGE) {
+                    ESP_LOGW(TAG, "电压值超出范围 (%.1f-%.1f): %.2f", 
+                            MIN_VOLTAGE, MAX_VOLTAGE, voltage);
+                    break;
                 }
+                    voltage = _constrain(voltage, 0.0f, 1.0f);
+                    foc_openloop_set_targetVoltage(voltage);
+                    ESP_LOGI(TAG, "设置开环电压为: %.2f V", voltage);
+                #else
+                    if (target.control_mode == FOC_CONTROL_MODE_TORQUE_VELOCITY_POSITION) {
+                        target.target_velocity = value / VELOCITY_SCALE;
+                        foc_closedloop_set_target(&target);
+                        ESP_LOGI(TAG, "设置闭环速度为: %.2f rad/s", target.target_velocity);
+                    } else {
+                        ESP_LOGW(TAG, "当前控制模式不支持速度设置");
+                    }
+                #endif
             }
             break;
             
@@ -446,31 +455,31 @@ static void foc_control_task(void* arg)
 
         // 速度和位置控制器参数
         .velocity_pid = {
-            .kp = 0.0125f,    // 比例系数
-            .ki = 0.015f,     // 积分系数
+            .kp = 0.022f,    // 比例系数
+            .ki = 0.3f,     // 积分系数
             .kd = 0.00002f,     // 微分控制
-            .output_limit = 0.5f,//速度PID积分限幅
+            .output_limit = 1.0f,//速度PID积分限幅
             .integral = 0.0f
         },
         .position_signal_pid = {
-            .kp = 0.5f,
-            .ki = 0.001f,
-            .kd = 0.00001f,     // 不使用微分控制
-            .output_limit = 0.5f,//位置PID积分限幅
+            .kp = 0.35f,
+            .ki = 0.1f,
+            .kd = 0.00001f,     // 微分控制
+            .output_limit = 0.8f,//位置PID积分限幅
             .integral = 0.0f
         },
         .position_raw_pid = {
-            .kp = 0.5f,
-            .ki = 0.001f,
-            .kd = 0.00001f,     // 不使用微分控制
+            .kp = 0.22f,
+            .ki = 0.12f,
+            .kd = 0.001f,     // 微分控制
             .output_limit = 0.5f,//位置PID积分限幅
             .integral = 0.0f
         },
         .position_pid = {
-            .kp = 0.5f,
-            .ki = 0.001f,
-            .kd = 0.00001f,     // 不使用微分控制
-            .output_limit = 0.5f,//位置PID积分限幅
+            .kp = 1.5f,
+            .ki = 0.23f,
+            .kd = 0.001f,     // 微分控制
+            .output_limit = 1.0f,//位置PID积分限幅
             .integral = 0.0f
         }
     };
@@ -494,6 +503,7 @@ static void foc_control_task(void* arg)
     foc_set_PhaseVoltage(0.0f, 0.0f, 0.0f, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter); 
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    target.target_position = as5600_get_total_angle_rad();
     // 设置目标
     foc_closedloop_set_target(&target);
     ESP_LOGI(TAG, "设置电流: %.2f A，开始闭环控制", target.target_current);
@@ -551,9 +561,8 @@ static void foc_control_task(void* arg)
 #else
             // 闭环控制
             velocity = as5600_get_speed_rad();
-            position_signal = as5600_get_position();
             position_rad = as5600_get_total_angle_rad();
-            foc_closedloop_set_motion_state(velocity, position_signal, position_rad);
+            foc_closedloop_set_motion_state(velocity, position_rad);
             foc_closedloop_output(inverter, &phase_currents, _IQ(electrical_angle));
 
 
