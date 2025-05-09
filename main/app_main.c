@@ -1,8 +1,3 @@
-/*
- * SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
 #include <stdio.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -20,6 +15,7 @@
 #include "esp_task_wdt.h"
 #include "esp_adc/adc_oneshot.h"  // 添加ADC单次转换头文件
 
+#define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define _2PI        6.28318530718f
 #define _PI         3.14159265359f
 #define _2PI_7      0.89759790102f
@@ -605,23 +601,28 @@ static void foc_control_task(void* arg)
         ESP_LOGI(TAG, "FOC闭环控制初始化完成");
     }
     
-    ESP_LOGI(TAG, "设置零电角度");
-    foc_duty_t duty;
-    foc_set_PhaseVoltage(0.5f, 0.0f, _3PI_2, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    as5600_update();
-    closedloop_params.zero_angle_rad = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, 0.0f);
-
-    ESP_LOGI(TAG, "设置零电角度: %.2f rad", closedloop_params.zero_angle_rad);
-    foc_set_PhaseVoltage(0.0f, 0.0f, 0.0f, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter); 
-    vTaskDelay(pdMS_TO_TICKS(100));
 
     target.target_position = as5600_get_total_angle_rad();
     // 设置目标
     foc_closedloop_set_target(&target);
     ESP_LOGI(TAG, "设置电流: %.2f A，开始闭环控制", target.target_current);
 #endif
+#if FOC_CONTROL_MODE_DEBUG == 1
+    ESP_LOGI(TAG, "设置零电角度");
+    foc_duty_t duty;
+    foc_set_PhaseVoltage(0.5f, 0.0f, _3PI_2, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    as5600_update();
+    #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_CLOSEDLOOP
+    closedloop_params.zero_angle_rad = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, 0.0f);
+    #else
+    openloop_params.zero_angle_rad = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, 0.0f);
+    #endif
 
+    ESP_LOGI(TAG, "设置零电角度: %.2f rad", as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, 0.0f) );
+    foc_set_PhaseVoltage(0.0f, 0.0f, 0.0f, EXAMPLE_FOC_MCPWM_PERIOD, EXAMPLE_MOTOR_MAX_VOLTAGE, &duty, inverter); 
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
     // 主循环变量声明 - 放在这里避免循环中重复声明
     float angle_elec = 0;
     float electrical_angle = 0;
@@ -646,8 +647,11 @@ static void foc_control_task(void* arg)
             // 更新编码器
             as5600_set_dt(dt / 1000000.0f);
             as5600_update();
+            #if FOC_CONTROL_MODE_SELECT == FOC_CONTROL_CLOSEDLOOP
             electrical_angle = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, closedloop_params.zero_angle_rad);
-            
+            #else
+            electrical_angle = as5600_get_electrical_angle(EXAMPLE_MOTOR_POLE_PAIRS, EXAMPLE_MOTOR_DIRECTION, openloop_params.zero_angle_rad);
+            #endif
             // 读取电流数据
             if (g_current_sense_initialized) {
                 // 直接采样获取电流，而不是读取其他任务更新的数据
@@ -739,8 +743,8 @@ static void foc_control_task(void* arg)
                     .current_v = g_current_reading.current_v,
                     .current_w = g_current_reading.current_w,
                     .encoder_electrical_angle = electrical_angle,
-                    .test_data = cl_state->vd,
-                    .test_data2 = cl_state->vq,
+/*                     .test_data = cl_state->vd,
+                    .test_data2 = cl_state->vq, */
                 };
                 
                 // 发送数据到队列，不等待(非阻塞)

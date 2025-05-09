@@ -245,7 +245,7 @@ float foc_openloop_output(inverter_handle_t inverter)
     id = _constrain(id, -current_limit/max_current, current_limit/max_current);
     iq = _constrain(iq, -current_limit/max_current, current_limit/max_current);
     foc_duty_t duty;
-    foc_set_PhaseVoltage(iq, id, p_state->angle_elec, s_openloop_params.period, s_openloop_params.voltage_magnitude, &duty, inverter);
+    foc_set_PhaseVoltage(iq, id, p_state->angle_elec, s_openloop_params.period, 1.0f, &duty, inverter);
     p_state->duty_u = duty.duty_u;  // 保存占空比
     p_state->duty_v = duty.duty_v;
     p_state->duty_w = duty.duty_w;
