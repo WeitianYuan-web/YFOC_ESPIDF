@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 // 选择要使用的电机配置
-#define MOTOR_CONFIG_SELECT MOTOR_CONFIG_1
+#define MOTOR_CONFIG_SELECT MOTOR_CONFIG_2
 
 // 电机配置1 - 2508云台电机
 #define MOTOR_CONFIG_1 1

@@ -14,6 +14,7 @@
 #include "motor_config.h"  // 添加电机配置头文件
 #include "esp_task_wdt.h"
 #include "esp_adc/adc_oneshot.h"  // 添加ADC单次转换头文件
+#include "soc/soc_caps.h"
 
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define _2PI        6.28318530718f
@@ -21,8 +22,8 @@
 #define _2PI_7      0.89759790102f
 #define _3PI_2      4.71238898038f
 // 选择FOC控制模式：FOC_CONTROL_OPENLOOP为开环控制，FOC_CONTROL_CLOSEDLOOP为闭环控制
-#define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_CLOSEDLOOP
-#define FOC_CONTROL_MODE_DEBUG     1
+#define FOC_CONTROL_MODE_SELECT    FOC_CONTROL_OPENLOOP
+#define FOC_CONTROL_MODE_DEBUG     0
 // 控制模式定义
 #define FOC_CONTROL_OPENLOOP       0
 #define FOC_CONTROL_CLOSEDLOOP     1
@@ -32,23 +33,31 @@ static const char *TAG = "example_foc";
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////// Please update the following configuration according to your HardWare spec /////////////////
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define EXAMPLE_FOC_DRV_EN_GPIO          12
-#define EXAMPLE_FOC_PWM_U_GPIO           33
-#define EXAMPLE_FOC_PWM_V_GPIO           32
-#define EXAMPLE_FOC_PWM_W_GPIO           25
+#define EXAMPLE_FOC_DRV_EN_GPIO          48
+#define EXAMPLE_FOC_PWM_U_H_GPIO         17
+#define EXAMPLE_FOC_PWM_U_L_GPIO         16
+#define EXAMPLE_FOC_PWM_V_H_GPIO         19
+#define EXAMPLE_FOC_PWM_V_L_GPIO         18
+#define EXAMPLE_FOC_PWM_W_H_GPIO         33
+#define EXAMPLE_FOC_PWM_W_L_GPIO         21
 
 // UART配置
 #define UART_NUM UART_NUM_0
-#define UART_TXD 1
-#define UART_RXD 3
+#define UART_TXD 43
+#define UART_RXD 44
 #define UART_BAUD_RATE 115200
 
 #define EXAMPLE_FOC_MCPWM_TIMER_RESOLUTION_HZ 20000000 // 20MHz, 1 tick = 0.05us
 #define EXAMPLE_FOC_MCPWM_PERIOD              2000     // 2000 * 0.05us = 100us, 10KHz
 
 // 电流采样引脚配置
-#define CURRENT_SENSE_U_PIN 36  
-#define CURRENT_SENSE_V_PIN 39  
+#define CURRENT_SENSE_U_PIN 3  
+#define CURRENT_SENSE_V_PIN 4  
+// AS5600编码器配置
+#define AS5600_SDA_PIN      8      // SDA引脚
+#define AS5600_SCL_PIN      9      // SCL引脚
+#define AS5600_I2C_FREQ     1000000  // 1MHz
+#define AS5600_I2C_PORT     I2C_NUM_0  // 使用I2C_0端口
 
 // 获取当前电机配置
 static const motor_config_t* motor_config;
@@ -63,11 +72,6 @@ static const motor_config_t* motor_config;
 #define EXAMPLE_MOTOR_MAX_VOLTAGE         (motor_config->max_voltage)
 #define EXAMPLE_MOTOR_OPENLOOP_RPM        (motor_config->openloop_rpm)
 
-// AS5600编码器配置
-#define AS5600_SDA_PIN      19      // SDA引脚
-#define AS5600_SCL_PIN      18      // SCL引脚
-#define AS5600_I2C_FREQ     1000000  // 1MHz
-#define AS5600_I2C_PORT     I2C_NUM_0  // 使用I2C_0端口
 
 void bsp_bridge_driver_init(void)
 {
@@ -815,15 +819,15 @@ void app_main(void)
             .flags.update_cmp_on_tez = true,
         },
         .gen_gpios = {
-            {EXAMPLE_FOC_PWM_U_GPIO, -1},  // 只使用高边PWM，低边设为-1表示不使用
-            {EXAMPLE_FOC_PWM_V_GPIO, -1},
-            {EXAMPLE_FOC_PWM_W_GPIO, -1},
+            {EXAMPLE_FOC_PWM_U_H_GPIO, EXAMPLE_FOC_PWM_U_L_GPIO},  // 只使用高边PWM，低边设为-1表示不使用
+            {EXAMPLE_FOC_PWM_V_H_GPIO, EXAMPLE_FOC_PWM_V_L_GPIO},
+            {EXAMPLE_FOC_PWM_W_H_GPIO, EXAMPLE_FOC_PWM_W_L_GPIO},
         },
         .dt_config = {
-            .posedge_delay_ticks = 1,
+            .posedge_delay_ticks = 4,
         },
         .inv_dt_config = {
-            .negedge_delay_ticks = 1,
+            .negedge_delay_ticks = 4,
             .flags.invert_output = true,
         },
     };
@@ -895,14 +899,16 @@ void app_main(void)
         ESP_LOGE(TAG, "无法创建UART数据队列");
         goto cleanup;
     }
-    
+    #if FOC_CONTROL_MODE_DEBUG == 0 
+    //不初始化as5600
+    #else
     // 初始化AS5600编码器
     ret = as5600_init(AS5600_SDA_PIN, AS5600_SCL_PIN, AS5600_I2C_FREQ, AS5600_I2C_PORT);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "初始化编码器失败: %s", esp_err_to_name(ret));
         goto cleanup;
     }
-    
+    #endif
     // 设置编码器采样周期 (与FOC控制频率相同)
     as5600_set_dt(1.0f / FOC_CONTROL_FREQ_HZ);
     

@@ -13,7 +13,7 @@ static const motor_config_t motor_config_1 = {
     .kv = 180.0f,               // 电机KV值(RPM/V)
     .direction = 1,            // 电机方向
     .current_limit = 0.9f,      // 电流限制(安培)
-    .max_voltage = 0.9f,        // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
+    .max_voltage = 0.5f,        // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
     .openloop_rpm = 400         // 开环控制转速 (RPM)
 };
 
@@ -25,7 +25,7 @@ static const motor_config_t motor_config_2 = {
     .supply_voltage = 12.0f,    // 电机供电电压(伏特)
     .kv = 2300.0f,               // 电机KV值(RPM/V)
     .direction = 1,             // 电机方向
-    .current_limit = 5.0f,      // 电流限制(安培)
+    .current_limit = 30.0f,      // 电流限制(安培)
     .max_voltage = 0.3f,        // 最大电压，对应PWM占空比的倍数 (0.0-1.0)
     .openloop_rpm = 500         // 开环控制转速 (RPM)
 };
